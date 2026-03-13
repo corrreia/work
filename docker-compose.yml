@@ -1,0 +1,49 @@
+services:
+
+  vpn:
+    image: ghcr.io/leleobhz/snx-rs-docker:latest
+    container_name: meo-vpn
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - ./snx-rs.conf:/etc/snx-rs/snx-rs.conf
+    ports:
+      - 127.0.0.1:8007:8006       # windows web viewer (8007 to avoid omarchy conflict)
+      - 127.0.0.1:3390:3389/tcp   # RDP (3390 to avoid omarchy conflict)
+      - 127.0.0.1:3390:3389/udp
+    restart: unless-stopped
+
+  windows:
+    image: dockurr/windows
+    container_name: meo-windows
+    network_mode: "service:vpn"
+    depends_on:
+      - vpn
+    environment:
+      VERSION: "11"
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "128G"
+      USERNAME: "${USERNAME}"
+      PASSWORD: "${PASSWORD}"
+      LANGUAGE: "English"
+      REGION: "pt-PT"
+      KEYBOARD: "pt-PT"
+      VM_NET_DEV_NAME: "docker"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./windows:/storage
+      - ./shared:/shared
+    restart: unless-stopped
+    stop_grace_period: 2m
