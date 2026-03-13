@@ -105,7 +105,19 @@ macOS VM:
 - **Split tunnel**: Server pushes full-tunnel routes, but `no-routing = true` ignores them. Only private subnets are routed through the VPN via `add-routes`. Internet goes direct.
 - **NAT**: iptables masquerade on both `snx-tun` (corporate) and `eth0` (internet). DNS is DNAT'd to corporate DNS for both internal and external resolution.
 - **RDP**: `xfreerdp3` with dynamic resolution, AVC444 graphics, clipboard, sound/mic, and Hyprland scale detection.
-- **Shared folder**: `./shared/` is exposed via Samba inside the VM at `\\172.30.0.1\Data`.
+- **Shared folder**: `./shared/` is mounted into both VMs, so it acts as a common exchange folder between Windows and macOS. Files written there from one VM are visible in the other.
+
+## Guest shared folder access
+
+Windows exposes the shared folder over Samba at `\\172.30.0.1\Data`.
+
+macOS can mount the same folder with 9p:
+
+```bash
+sudo -S mount_9p shared
+```
+
+After mounting it, open Finder and go to `Go -> Computer` to access the `shared` volume.
 
 ## Post-install (one-time, inside Windows)
 
