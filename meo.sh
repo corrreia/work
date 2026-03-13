@@ -40,12 +40,21 @@ vpn_connected() {
 # Set up NAT + DNS forwarding inside meo-vpn
 setup_nat() {
   docker exec meo-vpn sh -c "\
+    # --- Corporate traffic via VPN tunnel ---
     iptables -t nat -C POSTROUTING -o snx-tun -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o snx-tun -j MASQUERADE; \
     iptables -C FORWARD -i docker -o snx-tun -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i docker -o snx-tun -j ACCEPT; \
     iptables -C FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT; \
+    # --- Internet traffic via eth0 (home connection) ---
+    iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; \
+    iptables -C FORWARD -i docker -o eth0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i docker -o eth0 -j ACCEPT; \
+    iptables -C FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT; \
+    # --- DNS to corporate DNS ---
     iptables -t nat -C PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination 10.17.193.169:53 2>/dev/null || \
     iptables -t nat -A PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination 10.17.193.169:53; \
     iptables -t nat -C PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination 10.17.193.169:53 2>/dev/null || \
