@@ -20,9 +20,6 @@ services:
       - 127.0.0.1:8007:8006       # windows web viewer (8007 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/tcp   # RDP (3390 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/udp
-      - 127.0.0.1:8008:8008       # macos web viewer
-      - 127.0.0.1:5901:5901/tcp   # macos VNC
-      - 127.0.0.1:5901:5901/udp
       - 127.0.0.1:2222:22/tcp     # linux SSH
     restart: unless-stopped
 
@@ -50,36 +47,6 @@ services:
       - NET_ADMIN
     volumes:
       - ./windows:/storage
-      - ./shared:/shared
-    restart: unless-stopped
-    stop_grace_period: 2m
-
-  macos:
-    image: dockurr/macos
-    container_name: work-macos
-    network_mode: "service:vpn"
-    depends_on:
-      - vpn
-    environment:
-      VERSION: "15"
-      RAM_SIZE: "8G"
-      CPU_CORES: "4"
-      DISK_SIZE: "128G"
-      NETWORK: "passt"
-      DNSMASQ_DISABLE: "Y"
-      WEB_PORT: "8008"
-      VNC_PORT: "5901"
-      WSS_PORT: "5701"
-      WSD_PORT: "8009"
-      MON_PORT: "7101"
-      VM_NET_DEV: "eth0"
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - ./macos:/storage
       - ./shared:/shared
     restart: unless-stopped
     stop_grace_period: 2m

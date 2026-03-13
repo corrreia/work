@@ -59,7 +59,12 @@ setup_nat() {
     iptables -t nat -C PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53 2>/dev/null || \
     iptables -t nat -A PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53; \
     iptables -t nat -C PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53" 2>/dev/null
+    iptables -t nat -A PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53; \
+    # --- GitHub routes via VPN tunnel ---
+    ip route replace 192.30.252.0/22 dev snx-tun; \
+    ip route replace 185.199.108.0/22 dev snx-tun; \
+    ip route replace 140.82.112.0/20 dev snx-tun; \
+    ip route replace 143.55.64.0/20 dev snx-tun" 2>/dev/null
 }
 
 configure_linux_dns() {
@@ -208,15 +213,6 @@ cmd_status() {
     echo -e "  Linux:   ${RED}stopped${NC}"
   fi
 
-  # macOS
-  if container_running work-macos; then
-    echo -e "  macOS:   ${GREEN}running${NC}"
-    echo -e "           Web: http://127.0.0.1:8008"
-    echo -e "           VNC: 127.0.0.1:5901"
-  else
-    echo -e "  macOS:   ${RED}stopped${NC}"
-  fi
-
   echo ""
 }
 
@@ -240,9 +236,8 @@ cmd_logs() {
   case "$service" in
     vpn)     docker logs -f work-vpn ;;
     windows) docker logs -f work-windows ;;
-    macos)   docker logs -f work-macos ;;
     linux)   docker logs -f work-linux ;;
-    *)       die "Unknown service: $service. Use 'vpn', 'windows', 'linux', or 'macos'." ;;
+    *)       die "Unknown service: $service. Use 'vpn', 'windows', or 'linux'." ;;
   esac
 }
 
@@ -264,40 +259,7 @@ vm_start() {
   success "$vm started."
 }
 
-other_vm() {
-  local vm="$1"
-  case "$vm" in
-    windows) echo "macos" ;;
-    macos) echo "windows" ;;
-    *) echo "" ;;
-  esac
-}
 
-enforce_single_vm() {
-  local vm="$1"
-  local other
-  other=$(other_vm "$vm")
-
-  [ -n "$other" ] || return 0
-
-  if ! container_running "work-$other"; then
-    return 0
-  fi
-
-  warn "${other} is currently running. Only one OS can run at a time."
-  read -r -p "Stop ${other} and continue with ${vm}? [Y/n] " reply
-  reply=${reply:-Y}
-
-  case "$reply" in
-    y|Y|yes|YES)
-      vm_stop "$other"
-      sleep 2
-      ;;
-    *)
-      die "Aborted. Stop ${other} first or confirm the prompt."
-      ;;
-  esac
-}
 
 vm_stop() {
   local vm="$1"
@@ -321,9 +283,9 @@ vm_logs() {
 cmd_windows() {
   local action="${1:-help}"
   case "$action" in
-    start)   enforce_single_vm windows; vm_start windows ;;
+    start)   vm_start windows ;;
     stop)    vm_stop windows ;;
-    restart) enforce_single_vm windows; vm_restart windows ;;
+    restart) vm_restart windows ;;
     logs)    vm_logs work-windows ;;
     rdp)
       load_env
@@ -379,58 +341,6 @@ cmd_windows() {
 }
 
 # --- Future VM stubs ---
-
-cmd_macos() {
-  local action="${1:-help}"
-  case "$action" in
-    start)
-      enforce_single_vm macos
-      info "Starting macOS VM..."
-      $COMPOSE up -d macos
-      success "macOS started."
-      info "Inside macOS, run: sudo -S mount_9p shared"
-      ;;
-    stop)
-      info "Stopping macOS VM gracefully..."
-      $COMPOSE stop macos
-      success "macOS stopped."
-      ;;
-    restart)
-      enforce_single_vm macos
-      info "Stopping macOS VM gracefully..."
-      $COMPOSE stop macos
-      sleep 2
-      info "Starting macOS VM..."
-      $COMPOSE up -d macos
-      success "macOS restarted."
-      info "Inside macOS, run: sudo -S mount_9p shared"
-      ;;
-    web)
-      info "Opening macOS web viewer..."
-      xdg-open "http://127.0.0.1:8008" 2>/dev/null &
-      ;;
-    vnc)
-      info "Opening macOS VNC session..."
-      if command -v vncviewer &>/dev/null; then
-        vncviewer 127.0.0.1:5901 &
-        disown
-      else
-        warn "No VNC client found. Install tigervnc or use: ./work.sh macos web"
-      fi
-      ;;
-    logs)  vm_logs work-macos ;;
-    *)
-      echo -e "${BOLD}macOS VM commands:${NC}"
-      echo ""
-      echo "  ./work.sh macos start      Start the macOS VM"
-      echo "  ./work.sh macos stop       Graceful shutdown"
-      echo "  ./work.sh macos restart    Stop + start"
-      echo "  ./work.sh macos web        Open web viewer in browser"
-      echo "  ./work.sh macos vnc        Open VNC session"
-      echo "  ./work.sh macos logs       Tail container logs"
-      ;;
-  esac
-}
 
 cmd_linux() {
   local action="${1:-help}"
@@ -489,19 +399,17 @@ cmd_help() {
   echo "  ./work.sh up                 Start all containers"
   echo "  ./work.sh down               Stop all containers"
   echo "  ./work.sh status             Show VPN + VM status"
-  echo "  ./work.sh logs [vpn|windows|linux|macos] Tail container logs"
+  echo "  ./work.sh logs [vpn|windows|linux]  Tail container logs"
   echo ""
   echo -e "${BOLD}VMs:${NC}"
   echo "  ./work.sh windows <cmd>      Manage Windows VM (start|stop|restart|rdp|web|logs)"
   echo "  ./work.sh linux <cmd>        Manage Linux container (start|stop|restart|ssh|logs)"
-  echo "  ./work.sh macos <cmd>        Manage macOS VM (start|stop|restart|web|vnc|logs)"
   echo ""
   echo -e "${BOLD}Examples:${NC}"
   echo "  ./work.sh connect            Connect VPN, type 2FA, done"
   echo "  ./work.sh windows restart    Restart Windows VM"
   echo "  ./work.sh windows rdp        Open RDP session"
   echo "  ./work.sh linux ssh          Open SSH session to Arch"
-  echo "  ./work.sh macos web          Open macOS web viewer"
   echo "  ./work.sh status             Quick overview of everything"
 }
 
@@ -516,7 +424,6 @@ case "${1:-help}" in
   down)       cmd_down ;;
   logs)       shift; cmd_logs "$@" ;;
   windows)    shift; cmd_windows "$@" ;;
-  macos)      shift; cmd_macos "$@" ;;
   linux)      shift; cmd_linux "$@" ;;
   help|--help|-h) cmd_help ;;
   *)          die "Unknown command: $1. Run './work.sh help' for usage." ;;
