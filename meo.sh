@@ -358,6 +358,7 @@ cmd_macos() {
       info "Starting macOS VM..."
       $COMPOSE up -d macos
       success "macOS started."
+      info "Inside macOS, run: sudo -S mount_9p shared"
       ;;
     stop)
       info "Stopping macOS VM gracefully..."
@@ -372,6 +373,7 @@ cmd_macos() {
       info "Starting macOS VM..."
       $COMPOSE up -d macos
       success "macOS restarted."
+      info "Inside macOS, run: sudo -S mount_9p shared"
       ;;
     web)
       info "Opening macOS web viewer..."
