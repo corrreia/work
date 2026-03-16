@@ -118,14 +118,15 @@ cmd_connect() {
 
   info "Connecting VPN as $USERNAME to $VPN_SERVER..."
 
-  # Run snx-rs detached inside the container
+  # Run snx-rs detached inside the container, logging to /var/log/snx-rs.log
   docker exec -d work-vpn \
-    snx-rs -m standalone \
+    sh -c "snx-rs -m standalone \
       -c /etc/snx-rs/snx-rs.conf \
-      -s "$VPN_SERVER" \
-      -u "$USERNAME" \
-      -p "$FULL_PASSWORD_B64" \
-      -l "$log_level"
+      -s '$VPN_SERVER' \
+      -u '$USERNAME' \
+      -p '$FULL_PASSWORD_B64' \
+      -l '$log_level' \
+      >> /var/log/snx-rs.log 2>&1"
 
   # Wait for tunnel to come up
   local timeout=30
@@ -143,7 +144,10 @@ cmd_connect() {
 
   # If we get here, tunnel didn't come up — show logs for diagnosis
   warn "VPN tunnel did not come up within ${timeout}s."
-  echo "Check logs: ./work.sh logs vpn"
+  echo ""
+  echo -e "${DIM}--- snx-rs log ---${NC}"
+  docker exec work-vpn cat /var/log/snx-rs.log 2>/dev/null || echo "(no log output)"
+  echo -e "${DIM}--- end ---${NC}"
 }
 
 cmd_disconnect() {
@@ -234,7 +238,7 @@ cmd_down() {
 cmd_logs() {
   local service="${1:-vpn}"
   case "$service" in
-    vpn)     docker logs -f work-vpn ;;
+    vpn)     docker exec work-vpn tail -f /var/log/snx-rs.log 2>/dev/null || warn "No VPN logs yet. Connect first with: ./work.sh connect" ;;
     windows) docker logs -f work-windows ;;
     linux)   docker logs -f work-linux ;;
     *)       die "Unknown service: $service. Use 'vpn', 'windows', or 'linux'." ;;

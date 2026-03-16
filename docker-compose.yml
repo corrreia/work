@@ -21,7 +21,7 @@ services:
       - 127.0.0.1:3390:3389/tcp   # RDP (3390 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/udp
       - 127.0.0.1:2222:22/tcp     # linux SSH
-    restart: unless-stopped
+    restart: no
 
   windows:
     image: dockurr/windows
@@ -48,7 +48,7 @@ services:
     volumes:
       - ./windows:/storage
       - ./shared:/shared
-    restart: unless-stopped
+    restart: no
     stop_grace_period: 2m
 
   linux:
@@ -66,4 +66,4 @@ services:
     volumes:
       - ./linux:/home/${USERNAME}
       - ./shared:/shared
-    restart: unless-stopped
+    restart: no
