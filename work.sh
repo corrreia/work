@@ -6,6 +6,10 @@ COMPOSE="docker compose -f $SCRIPT_DIR/docker-compose.yml"
 VM_SUBNET="172.30.0.0/24"   # dockurr's bridge inside work-vpn
 VPN_RUNTIME_CONF="/run/snx-rs-connect.conf"
 
+# GitHub's published ranges (api.github.com/meta). Corporate GitHub is
+# IP-allowlisted to company egress, so these route through the tunnel by default.
+GITHUB_ROUTES="192.30.252.0/22,185.199.108.0/22,140.82.112.0/20,143.55.64.0/20"
+
 # Runs inside work-vpn with $corporate_dns set. Without the tunnel the
 # corporate resolver is unreachable, so a leftover redirect kills Windows DNS.
 DNS_TEARDOWN='
@@ -793,7 +797,8 @@ cmd_setup() {
   read -rsp "VPN password (VPN_PASSWORD), rotates ~45d, Enter to fill later: " vpn_password
   echo ""
   read -p "Corporate DNS (CORPORATE_DNS) [IT]: " corporate_dns
-  read -p "Extra ranges through the tunnel (VPN_EXTRA_ROUTES), comma-separated, e.g. corporate GitHub ranges [optional]: " extra_routes
+  read -p "Extra ranges through the tunnel (VPN_EXTRA_ROUTES), comma-separated [GitHub ranges]: " extra_routes
+  extra_routes="${extra_routes:-$GITHUB_ROUTES}"
   read -p "Internal host for ./work.sh test (VPN_TEST_HOST) [optional]: " test_host
 
   # Single-quote every value so load_env can source the file even when a
