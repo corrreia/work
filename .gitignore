@@ -1,7 +1,10 @@
 .env
+.env.*
+!.env.example
 windows/
 macos/
 linux/
 certificates/
 shared/*
 !shared/.gitkeep
+.claude/settings.local.json

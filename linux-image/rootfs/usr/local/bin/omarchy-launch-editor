@@ -1,0 +1,4 @@
+#!/bin/bash
+# Container stand-in for Omarchy's launcher: always edit inline in the terminal.
+[[ $1 == --inline ]] && shift
+exec nvim "$@"

@@ -3,19 +3,18 @@ name: work
 services:
 
   vpn:
-    image: ghcr.io/leleobhz/snx-rs-docker:latest
+    # snx-rs 6.2.4, pinned: releases have changed routing and forwarding
+    # behaviour that work.sh depends on. Re-test connect + both guests on bump.
+    image: ghcr.io/leleobhz/snx-rs-docker@sha256:e2ac132173e9b6edacddd5a7aab567de1d925e8a9cf8b59d07766f351fc2cff3
     container_name: work-vpn
     command: ["sleep", "infinity"]
     stdin_open: true
     tty: true
-    cap_add:
-      - NET_ADMIN
+    privileged: true
     devices:
       - /dev/net/tun
     sysctls:
       - net.ipv4.ip_forward=1
-    volumes:
-      - ./snx-rs.conf:/etc/snx-rs/snx-rs.conf
     ports:
       - 127.0.0.1:8007:8006       # windows web viewer (8007 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/tcp   # RDP (3390 to avoid omarchy conflict)
@@ -34,7 +33,7 @@ services:
       CPU_CORES: "4"
       DISK_SIZE: "128G"
       USERNAME: "${USERNAME}"
-      PASSWORD: "${PASSWORD}"
+      PASSWORD: "${VM_PASSWORD}"
       LANGUAGE: "English"
       REGION: "pt-PT"
       KEYBOARD: "pt-PT"
@@ -61,7 +60,7 @@ services:
       - vpn
     environment:
       USERNAME: "${USERNAME}"
-      PASSWORD: "${PASSWORD}"
+      PASSWORD: "${VM_PASSWORD}"
     volumes:
       - ./linux:/home/${USERNAME}
       - ./shared:/shared

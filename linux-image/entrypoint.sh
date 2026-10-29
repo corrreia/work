@@ -15,6 +15,17 @@ echo "$username:$password" | chpasswd
 ln -sfn /shared "$home_dir/Shared"
 chown -h "$username:$username" "$home_dir/Shared"
 
+# Seed the Omarchy shell and terminal configs into the (bind-mounted) home.
+# Whole items only, and never over something already there, so local edits
+# and deletions stick across restarts.
+skel=/usr/share/work-linux/home
+for item in "$skel"/.bashrc "$skel"/.bash_profile "$skel"/.config/*; do
+  target="$home_dir/${item#"$skel"/}"
+  [ -e "$target" ] || [ -L "$target" ] && continue
+  runuser -u "$username" -- mkdir -p "$(dirname "$target")"
+  runuser -u "$username" -- cp -r "$item" "$target"
+done
+
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$username" > "/etc/sudoers.d/${username}"
 chmod 0440 "/etc/sudoers.d/${username}"
 

@@ -3,7 +3,15 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE="docker compose -f $SCRIPT_DIR/docker-compose.yml"
-CORPORATE_DNS="10.17.193.169"
+VM_SUBNET="172.30.0.0/24"   # dockurr's bridge inside work-vpn
+VPN_RUNTIME_CONF="/run/snx-rs-connect.conf"
+
+# Runs inside work-vpn with $corporate_dns set. Without the tunnel the
+# corporate resolver is unreachable, so a leftover redirect kills Windows DNS.
+DNS_TEARDOWN='
+for proto in udp tcp; do
+  while iptables -t nat -D PREROUTING -i docker -p "$proto" --dport 53 -j DNAT --to-destination "${corporate_dns}:53" 2>/dev/null; do :; done
+done'
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -28,6 +36,19 @@ load_env() {
   set +a
 }
 
+# Fail with a named error instead of letting an empty credential reach a guest
+# or the tunnel. VM_PASSWORD and VPN_PASSWORD are deliberately independent:
+# VPN_PASSWORD rotates on the corporate schedule, VM_PASSWORD does not.
+require_env() {
+  local var missing=()
+  for var in "$@"; do
+    [ -n "${!var:-}" ] || missing+=("$var")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    die "Missing in .env: ${missing[*]}. See .env.example."
+  fi
+}
+
 # Check if a container is running
 container_running() {
   [ "$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" = "running" ]
@@ -40,37 +61,76 @@ vpn_connected() {
 
 # Set up NAT + DNS forwarding inside work-vpn
 setup_nat() {
-  docker exec work-vpn sh -c "\
-    # --- Corporate traffic via VPN tunnel ---
-    iptables -t nat -C POSTROUTING -o snx-tun -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o snx-tun -j MASQUERADE; \
-    iptables -C FORWARD -i docker -o snx-tun -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i docker -o snx-tun -j ACCEPT; \
-    iptables -C FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT; \
-    # --- Internet traffic via eth0 (home connection) ---
-    iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; \
-    iptables -C FORWARD -i docker -o eth0 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i docker -o eth0 -j ACCEPT; \
-    iptables -C FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT; \
-    # --- DNS to corporate DNS ---
-    iptables -t nat -C PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53; \
-    iptables -t nat -C PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination ${CORPORATE_DNS}:53; \
-    # --- GitHub routes via VPN tunnel ---
-    ip route replace 192.30.252.0/22 dev snx-tun; \
-    ip route replace 185.199.108.0/22 dev snx-tun; \
-    ip route replace 140.82.112.0/20 dev snx-tun; \
-    ip route replace 143.55.64.0/20 dev snx-tun" 2>/dev/null
+  load_env
+  require_env CORPORATE_DNS
+  docker exec -i work-vpn sh -s -- "$CORPORATE_DNS" "$VM_SUBNET" "${VPN_EXTRA_ROUTES:-}" <<'EOF'
+set -e
+corporate_dns="$1"
+vm_subnet="$2"
+extra_routes="$3"
+vpn_table="18000"
+local_pref="17900"
+
+# snx-rs turns forwarding off on the tunnel unless allow-forwarding is set,
+# which silently drops every reply headed for the Windows VM.
+if [ "$(cat /proc/sys/net/ipv4/conf/snx-tun/forwarding)" != "1" ]; then
+  echo "forwarding is disabled on snx-tun (allow-forwarding missing from snx-rs.conf?)" >&2
+  exit 1
+fi
+
+# --- Corporate traffic via VPN tunnel ---
+iptables -t nat -C POSTROUTING -o snx-tun -j MASQUERADE 2>/dev/null ||
+  iptables -t nat -A POSTROUTING -o snx-tun -j MASQUERADE
+iptables -C FORWARD -i docker -o snx-tun -j ACCEPT 2>/dev/null ||
+  iptables -A FORWARD -i docker -o snx-tun -j ACCEPT
+iptables -C FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+  iptables -A FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# snx-rs consults its own table ahead of main, and its 172.16.0.0/12 route
+# covers both the Docker network and the VM bridge. Send those back to main by
+# rule, so it holds whether or not the VM bridge exists yet.
+while ip rule del pref "$local_pref" 2>/dev/null; do :; done
+for subnet in $(ip -4 route show dev eth0 proto kernel scope link | awk '{print $1}') "$vm_subnet"; do
+  ip rule add to "$subnet" lookup main pref "$local_pref"
+done
+ip route replace 10.0.0.0/8 dev snx-tun table "$vpn_table"
+ip route replace 172.16.0.0/12 dev snx-tun table "$vpn_table"
+ip route replace 192.168.0.0/16 dev snx-tun table "$vpn_table"
+
+# --- Internet traffic via eth0 (home connection) ---
+iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null ||
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -C FORWARD -i docker -o eth0 -j ACCEPT 2>/dev/null ||
+  iptables -A FORWARD -i docker -o eth0 -j ACCEPT
+iptables -C FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+  iptables -A FORWARD -i eth0 -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# --- DNS to corporate DNS ---
+iptables -t nat -C PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination "${corporate_dns}:53" 2>/dev/null ||
+  iptables -t nat -A PREROUTING -i docker -p udp --dport 53 -j DNAT --to-destination "${corporate_dns}:53"
+iptables -t nat -C PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination "${corporate_dns}:53" 2>/dev/null ||
+  iptables -t nat -A PREROUTING -i docker -p tcp --dport 53 -j DNAT --to-destination "${corporate_dns}:53"
+
+# --- Extra public ranges that must go through the tunnel ---
+for route in $(echo "$extra_routes" | tr ',' ' '); do
+  ip route replace "$route" dev snx-tun
+done
+ip route flush cache 2>/dev/null || true
+EOF
+}
+
+teardown_nat() {
+  load_env
+  require_env CORPORATE_DNS
+  docker exec work-vpn sh -c "corporate_dns=\"\$1\"; $DNS_TEARDOWN" sh "$CORPORATE_DNS"
 }
 
 configure_linux_dns() {
   container_running work-linux || return 0
 
   if vpn_connected; then
+    load_env
+    require_env CORPORATE_DNS
     docker exec work-linux sh -lc "cat > /etc/resolv.conf <<EOF
 nameserver ${CORPORATE_DNS}
 search .
@@ -128,10 +188,12 @@ cmd_connect() {
   [[ "$1" == "--debug" || "$1" == "-debug" ]] && log_level=debug
 
   load_env
+  require_env USERNAME VPN_SERVER VPN_PASSWORD CORPORATE_DNS
 
   # Check if already connected
   if vpn_connected; then
     warn "VPN is already connected."
+    setup_nat || warn "Could not apply NAT/routing inside work-vpn; guests may not reach the VPN."
     cmd_status
     return
   fi
@@ -150,40 +212,55 @@ cmd_connect() {
 
   container_running work-vpn || die "work-vpn failed to start"
 
-  [ -n "$VPN_SERVER" ] || die "VPN_SERVER not set in .env"
-
   info "Connecting VPN as $USERNAME to $VPN_SERVER..."
 
-  # Run snx-rs detached inside the container, logging to /var/log/snx-rs.log
-  docker exec -d work-vpn \
-    sh -c "snx-rs -m standalone \
-      -c /etc/snx-rs/snx-rs.conf \
-      -s '$VPN_SERVER' \
-      -u '$USERNAME' \
-      -p '$FULL_PASSWORD_B64' \
-      -l '$log_level' \
-      >> /var/log/snx-rs.log 2>&1"
+  # Hand the credentials over in a root-only file instead of argv, which stays
+  # readable in the host process list for the life of the tunnel.
+  {
+    cat "$SCRIPT_DIR/snx-rs.conf"
+    printf '\nserver-name = %s\nuser-name = %s\npassword = %s\n' \
+      "$VPN_SERVER" "$USERNAME" "$FULL_PASSWORD_B64"
+  } | docker exec -i work-vpn sh -c "umask 077 && cat > $VPN_RUNTIME_CONF"
+
+  # Run snx-rs detached inside the container, logging to /var/log/snx-rs.log.
+  # Whenever it exits, for any reason, the guest DNS redirect goes with it.
+  docker exec -d work-vpn sh -c "
+    snx-rs -m standalone -c \"\$1\" -l \"\$2\" >> /var/log/snx-rs.log 2>&1
+    rm -f \"\$1\"
+    corporate_dns=\"\$3\"; $DNS_TEARDOWN" \
+    sh "$VPN_RUNTIME_CONF" "$log_level" "$CORPORATE_DNS"
 
   # Wait for tunnel to come up
-  local timeout=30
-  for i in $(seq 1 $timeout); do
+  local timeout=30 waited
+  for waited in $(seq 1 $timeout); do
+    sleep 1
     if vpn_connected; then
-      setup_nat
-      configure_linux_dns
+      docker exec work-vpn rm -f "$VPN_RUNTIME_CONF"
       echo ""
-      success "VPN connected."
+      if setup_nat; then
+        success "VPN connected."
+      else
+        warn "VPN connected, but NAT/routing setup inside work-vpn failed; guests may not reach the VPN."
+      fi
       cmd_status
       return
     fi
-    sleep 1
+    # snx-rs already gave up: no point waiting out the clock
+    docker exec work-vpn pgrep -x snx-rs >/dev/null 2>&1 || break
   done
 
   # If we get here, tunnel didn't come up — show logs for diagnosis
-  warn "VPN tunnel did not come up within ${timeout}s."
+  docker exec work-vpn rm -f "$VPN_RUNTIME_CONF" 2>/dev/null || true
+  if [ "$waited" -lt "$timeout" ]; then
+    warn "snx-rs exited after ${waited}s without bringing the tunnel up."
+  else
+    warn "VPN tunnel did not come up within ${timeout}s."
+  fi
   echo ""
   echo -e "${DIM}--- snx-rs log ---${NC}"
-  docker exec work-vpn cat /var/log/snx-rs.log 2>/dev/null || echo "(no log output)"
+  docker exec work-vpn tail -n 40 /var/log/snx-rs.log 2>/dev/null || echo "(no log output)"
   echo -e "${DIM}--- end ---${NC}"
+  return 1
 }
 
 cmd_disconnect() {
@@ -196,6 +273,8 @@ cmd_disconnect() {
     warn "VPN tunnel is not up."
     # Still kill any lingering snx-rs process
     docker exec work-vpn killall snx-rs 2>/dev/null || true
+    teardown_nat
+    configure_linux_dns
     return
   fi
 
@@ -205,7 +284,10 @@ cmd_disconnect() {
   if vpn_connected; then
     warn "Tunnel still up, forcing..."
     docker exec work-vpn killall -9 snx-rs 2>/dev/null || true
+    sleep 1
   fi
+  vpn_connected && die "Could not stop snx-rs; the tunnel is still up."
+  teardown_nat
   configure_linux_dns
   success "VPN disconnected."
 }
@@ -217,6 +299,9 @@ cmd_reconnect() {
 }
 
 cmd_status() {
+  # The tunnel can drop on its own; keep the Linux resolver in step with it.
+  configure_linux_dns
+
   echo -e "${BOLD}Work Environment Status${NC}"
   echo ""
 
@@ -248,7 +333,7 @@ cmd_status() {
   # Linux
   if container_running work-linux; then
     echo -e "  Linux:   ${GREEN}running${NC}"
-    echo -e "           Shell: ./work.sh linux ssh"
+    echo -e "           Shell: ./work.sh linux shell"
   else
     echo -e "  Linux:   ${RED}stopped${NC}"
   fi
@@ -256,8 +341,89 @@ cmd_status() {
   echo ""
 }
 
+# Resolve + connect to an internal-only host along both guest paths. The VPN
+# hands out a single address: Linux shares work-vpn's network namespace and
+# uses it directly, Windows is masqueraded behind it.
+cmd_test() {
+  local host failed=0 out addr
+
+  load_env
+  host="${1:-${VPN_TEST_HOST:-}}"
+  [ -n "$host" ] || die "No host to test. Pass one (./work.sh test <host>) or set VPN_TEST_HOST in .env."
+
+  container_running work-vpn || die "work-vpn is not running. Run: ./work.sh up"
+  vpn_connected || die "VPN tunnel is down. Run: ./work.sh connect"
+
+  echo -e "${BOLD}VPN test: $host${NC}"
+  echo ""
+
+  # Linux path: locally originated traffic, resolver pointed at corporate DNS
+  if container_running work-linux; then
+    addr=$(docker exec work-linux getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -z "$addr" ]; then
+      echo -e "  Linux:   ${RED}DNS failed${NC} (resolver: $(docker exec work-linux awk '/^nameserver/{print $2; exit}' /etc/resolv.conf))"
+      failed=1
+    elif docker exec work-linux timeout 8 bash -c "exec 3<>/dev/tcp/$addr/443" 2>/dev/null; then
+      echo -e "  Linux:   ${GREEN}ok${NC} ($host -> $addr, tcp/443 open)"
+    else
+      echo -e "  Linux:   ${RED}resolved $addr but tcp/443 failed${NC}"
+      failed=1
+    fi
+  else
+    echo -e "  Linux:   ${DIM}not running, skipped${NC}"
+  fi
+
+  # Windows path: a throwaway namespace plugged into the VM bridge, so the
+  # probe is forwarded, DNS-redirected and NATed exactly like the VM's traffic.
+  if container_running work-windows; then
+    out=$(docker exec -i work-vpn sh -s -- "$host" 2>&1 <<'EOF'
+host="$1"
+ns="work-probe"
+cleanup() {
+  ip netns del "$ns" 2>/dev/null
+  ip link del probe0 2>/dev/null
+  rm -rf "/etc/netns/$ns"
+}
+trap cleanup EXIT
+cleanup
+
+gw=$(ip -4 -o addr show dev docker 2>/dev/null | awk 'NR==1{print $4}')
+[ -n "$gw" ] || { echo "VM bridge not up yet"; exit 1; }
+probe_ip="${gw%.*}.250/${gw#*/}"
+
+set -e
+ip netns add "$ns"
+ip link add probe0 type veth peer name probe1 netns "$ns"
+ip link set probe0 master docker up
+ip -n "$ns" link set lo up
+ip -n "$ns" addr add "$probe_ip" dev probe1
+ip -n "$ns" link set probe1 up
+ip -n "$ns" route add default via "${gw%/*}"
+mkdir -p "/etc/netns/$ns"
+echo "nameserver ${gw%/*}" > "/etc/netns/$ns/resolv.conf"
+set +e
+
+addr=$(ip netns exec "$ns" timeout 12 getent ahostsv4 "$host" | awk 'NR==1{print $1}')
+[ -n "$addr" ] || { echo "DNS failed"; exit 1; }
+ip netns exec "$ns" timeout 8 bash -c "exec 3<>/dev/tcp/$addr/443" 2>/dev/null ||
+  { echo "resolved $addr but tcp/443 failed"; exit 1; }
+echo "$host -> $addr, tcp/443 open"
+EOF
+    ) && echo -e "  Windows: ${GREEN}ok${NC} ($out)" || {
+      echo -e "  Windows: ${RED}${out}${NC}"
+      failed=1
+    }
+  else
+    echo -e "  Windows: ${DIM}not running, skipped${NC}"
+  fi
+
+  echo ""
+  return $failed
+}
+
 cmd_up() {
   load_env
+  require_env USERNAME VM_PASSWORD
   info "Starting all containers..."
   $COMPOSE up -d --build
   configure_linux_dns
@@ -287,6 +453,7 @@ cmd_logs() {
 vm_start() {
   local vm="$1"
   load_env
+  require_env USERNAME VM_PASSWORD
 
   # Ensure VPN container is up first (VMs depend on it for networking)
   if ! container_running work-vpn; then
@@ -340,15 +507,18 @@ cmd_windows() {
     logs)    vm_logs work-windows ;;
     rdp)
       load_env
+      require_env USERNAME VM_PASSWORD
       prepare_windows_certs >/dev/null
 
       # Detect Hyprland display scale
       local rdp_scale=""
       local rdp_log="/tmp/work-windows-rdp.log"
       if command -v hyprctl &>/dev/null; then
-        local hypr_scale
-        hypr_scale=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused == true) | .scale' 2>/dev/null)
-        if [ -n "$hypr_scale" ]; then
+        local hypr_json hypr_scale
+        if hypr_json=$(hyprctl monitors -j 2>/dev/null); then
+          hypr_scale=$(printf '%s' "$hypr_json" | jq -r '.[] | select(.focused == true) | .scale' 2>/dev/null || true)
+        fi
+        if [ -n "${hypr_scale:-}" ]; then
           local scale_pct
           scale_pct=$(echo "$hypr_scale" | awk '{print int($1 * 100)}')
           if (( scale_pct >= 170 )); then
@@ -360,22 +530,40 @@ cmd_windows() {
       fi
 
       info "Opening RDP to Windows VM..."
-      nohup xfreerdp3 \
-        /v:127.0.0.1:3390 \
-        /u:"$USERNAME" \
-        /p:"$PASSWORD" \
-        /cert:ignore \
-        /dynamic-resolution \
-        /gfx:AVC444 \
-        /floatbar:sticky:off,default:visible,show:fullscreen \
-        /sound \
-        /microphone \
-        /clipboard \
-        /title:"Work Windows" \
-        -grab-keyboard \
-        $rdp_scale \
-        >"$rdp_log" 2>&1 </dev/null &
-      disown
+      local rdp_args rdp_pid
+      rdp_args=$(mktemp /tmp/work-windows-rdp.XXXXXX)
+      chmod 600 "$rdp_args"
+      {
+        printf '%s\n' "/v:127.0.0.1:3390"
+        printf '%s\n' "/u:localhost\\$USERNAME"
+        printf '%s\n' "/p:$VM_PASSWORD"
+        printf '%s\n' "/auth-pkg-list:none,ntlm"
+        printf '%s\n' "/cert:ignore"
+        printf '%s\n' "/dynamic-resolution"
+        printf '%s\n' "/gfx:AVC444"
+        printf '%s\n' "/floatbar:sticky:off,default:visible,show:fullscreen"
+        printf '%s\n' "/sound"
+        printf '%s\n' "/microphone"
+        printf '%s\n' "/clipboard"
+        printf '%s\n' "/title:Work Windows"
+        printf '%s\n' "-grab-keyboard"
+        [ -n "$rdp_scale" ] && printf '%s\n' "$rdp_scale"
+      } >"$rdp_args"
+
+      nohup xfreerdp3 /args-from:"$rdp_args" >"$rdp_log" 2>&1 </dev/null &
+      rdp_pid=$!
+      sleep 2
+      rm -f "$rdp_args"
+
+      if ! kill -0 "$rdp_pid" 2>/dev/null; then
+        warn "RDP exited immediately. Recent log output:"
+        echo -e "${DIM}--- $rdp_log ---${NC}"
+        tail -n 40 "$rdp_log" 2>/dev/null || true
+        echo -e "${DIM}--- end ---${NC}"
+        return 1
+      fi
+
+      disown "$rdp_pid" 2>/dev/null || true
       success "RDP launched. Logs: $rdp_log"
       ;;
     certs)
@@ -423,15 +611,28 @@ cmd_linux() {
     logs)
       vm_logs work-linux
       ;;
-    ssh)
+    shell|ssh)
       if ! container_running work-linux; then
         info "Linux container is not running, starting it..."
         vm_start linux
         configure_linux_dns
       fi
       load_env
-      info "Opening shell in Linux container..."
-      exec docker exec -it -u "$USERNAME" work-linux bash -l
+      require_env USERNAME
+      # docker exec defaults to TERM=xterm; hand over the real terminal so
+      # colours, the prompt and nvim behave as they do on the host.
+      exec docker exec -it -u "$USERNAME" -w "/home/$USERNAME" \
+        -e TERM="${TERM:-xterm-256color}" -e COLORTERM="${COLORTERM:-truecolor}" \
+        work-linux bash -l
+      ;;
+    rebuild)
+      info "Snapshotting host Omarchy config..."
+      "$SCRIPT_DIR/linux-image/sync-host-config.sh"
+      info "Rebuilding the Linux image..."
+      $COMPOSE build linux
+      $COMPOSE up -d --force-recreate linux
+      configure_linux_dns
+      success "Linux container rebuilt. Configs already in your home are kept; delete one to get the fresh copy."
       ;;
     *)
       echo -e "${BOLD}Linux commands:${NC}"
@@ -439,7 +640,8 @@ cmd_linux() {
       echo "  ./work.sh linux start      Start the Linux container"
       echo "  ./work.sh linux stop       Stop the Linux container"
       echo "  ./work.sh linux restart    Stop + start"
-      echo "  ./work.sh linux ssh        Open interactive shell"
+      echo "  ./work.sh linux shell      Open interactive shell (alias: ssh)"
+      echo "  ./work.sh linux rebuild    Re-snapshot host Omarchy config and rebuild the image"
       echo "  ./work.sh linux logs       Tail container logs"
       ;;
   esac
@@ -450,6 +652,10 @@ cmd_linux() {
 cmd_help() {
   echo -e "${BOLD}work.sh${NC} — Corporate remote environment manager"
   echo ""
+  echo -e "${BOLD}Setup:${NC}"
+  echo "  ./work.sh setup              Create .env interactively (first run)"
+  echo "  ./work.sh doctor             Check prerequisites (Docker, KVM, tun, tools)"
+  echo ""
   echo -e "${BOLD}VPN:${NC}"
   echo "  ./work.sh connect [--debug]  Connect VPN (prompts for 2FA)"
   echo "  ./work.sh disconnect         Disconnect VPN"
@@ -459,18 +665,152 @@ cmd_help() {
   echo "  ./work.sh up                 Start all containers"
   echo "  ./work.sh down               Stop all containers"
   echo "  ./work.sh status             Show VPN + VM status"
+  echo "  ./work.sh test [host]        Check internal DNS + reachability from both guests"
   echo "  ./work.sh logs [vpn|windows|linux]  Tail container logs"
   echo ""
   echo -e "${BOLD}VMs:${NC}"
   echo "  ./work.sh windows <cmd>      Manage Windows VM (start|stop|restart|rdp|web|logs)"
-  echo "  ./work.sh linux <cmd>        Manage Linux container (start|stop|restart|ssh|logs)"
+  echo "  ./work.sh linux <cmd>        Manage Linux container (start|stop|restart|shell|rebuild|logs)"
   echo ""
   echo -e "${BOLD}Examples:${NC}"
   echo "  ./work.sh connect            Connect VPN, type 2FA, done"
   echo "  ./work.sh windows restart    Restart Windows VM"
   echo "  ./work.sh windows rdp        Open RDP session"
-  echo "  ./work.sh linux ssh          Open shell in Arch container"
+  echo "  ./work.sh linux shell        Open shell in Arch container"
   echo "  ./work.sh status             Quick overview of everything"
+}
+
+# --- Setup / preflight ---
+
+# One prerequisite check. `kind` is req or opt: a failed req is counted by the
+# caller and blocks, a failed opt only warns. The probe is a shell snippet.
+check() {
+  local kind="$1" label="$2" probe="$3" hint="$4"
+  if bash -c "$probe" >/dev/null 2>&1; then
+    printf '  %bok%b      %s\n' "$GREEN" "$NC" "$label"
+    return 0
+  fi
+  if [ "$kind" = req ]; then
+    printf '  %bmissing%b %s\n' "$RED" "$NC" "$label"
+  else
+    printf '  %babsent%b  %s\n' "$YELLOW" "$NC" "$label"
+  fi
+  printf '          %b%s%b\n' "$DIM" "$hint" "$NC"
+  return 1
+}
+
+# Single-quote a value for safe inclusion in .env, which load_env later sources.
+# Without this a value with a space, $, #, quote or backslash breaks sourcing:
+# each embedded ' becomes '\'' and the whole is wrapped in single quotes.
+env_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+cmd_doctor() {
+  echo -e "${BOLD}Preflight${NC}"
+  echo ""
+  local fails=0
+
+  check req "Docker"             'command -v docker'                   "Install Docker. See https://docs.docker.com/engine/install/" || fails=$((fails + 1))
+  check req "Docker daemon"      'docker info'                         "Start Docker, or add yourself to the docker group and re-login." || fails=$((fails + 1))
+  check req "Docker Compose v2"  'docker compose version'              "Install the docker compose plugin." || fails=$((fails + 1))
+  check req "KVM (/dev/kvm)"     '[ -r /dev/kvm ] && [ -w /dev/kvm ]'  "Enable virtualization in BIOS, add yourself to the kvm group, re-login." || fails=$((fails + 1))
+  check req "TUN (/dev/net/tun)" '[ -e /dev/net/tun ]'                 "Load the module: sudo modprobe tun." || fails=$((fails + 1))
+
+  echo ""
+  check opt "xfreerdp3"          'command -v xfreerdp3'                "Only for ./work.sh windows rdp (package: freerdp). ./work.sh windows web works without it." || true
+  check opt "jq"                 'command -v jq'                       "Only for Hyprland RDP scale detection." || true
+
+  echo ""
+  # Repo integrity. The Linux image build copies this snapshot, so a clone
+  # missing it fails the build. Catch it here, not halfway through a build.
+  check req "Linux image rootfs" "[ -d '$SCRIPT_DIR/linux-image/rootfs' ]" "linux-image/rootfs/ is missing. It must be committed to the repo; ask whoever shared it." || fails=$((fails + 1))
+  check opt ".env"               "[ -f '$SCRIPT_DIR/.env' ]"           "Not configured yet. Run ./work.sh setup." || true
+
+  echo ""
+  if [ "$fails" -gt 0 ]; then
+    warn "$fails required check(s) failed. Fix the above, then re-run ./work.sh doctor."
+    return 1
+  fi
+  success "All required checks passed."
+}
+
+cmd_setup() {
+  local env_file="$SCRIPT_DIR/.env"
+  local example="$SCRIPT_DIR/.env.example"
+
+  [ -f "$example" ] || die ".env.example not found. Run this from the repo root."
+
+  echo -e "${BOLD}Work environment setup${NC}"
+  echo ""
+  echo -e "${DIM}Fields marked [IT] come from your IT admin or Check Point client logs.${NC}"
+  echo -e "${DIM}Press Enter to accept a default shown in [brackets].${NC}"
+  echo ""
+
+  if [ -f "$env_file" ]; then
+    warn ".env already exists."
+    read -p "Overwrite it (a backup goes to .env.bak)? [y/N] " ans
+    case "$ans" in
+      y | Y) cp "$env_file" "$env_file.bak" ;;
+      *)
+        info "Keeping existing .env. Nothing changed."
+        return 0
+        ;;
+    esac
+  fi
+
+  local username vm_password vpn_server vpn_password corporate_dns extra_routes test_host
+
+  read -p "Local guest username (USERNAME) [your.username]: " username
+  username="${username:-your.username}"
+
+  read -rsp "Local guest password (VM_PASSWORD), does not rotate [changeme]: " vm_password
+  echo ""
+  vm_password="${vm_password:-changeme}"
+
+  read -p "VPN gateway IP (VPN_SERVER) [IT]: " vpn_server
+  read -rsp "VPN password (VPN_PASSWORD), rotates ~45d, Enter to fill later: " vpn_password
+  echo ""
+  read -p "Corporate DNS (CORPORATE_DNS) [IT]: " corporate_dns
+  read -p "Extra ranges through the tunnel (VPN_EXTRA_ROUTES), comma-separated, e.g. corporate GitHub ranges [optional]: " extra_routes
+  read -p "Internal host for ./work.sh test (VPN_TEST_HOST) [optional]: " test_host
+
+  # Single-quote every value so load_env can source the file even when a
+  # password holds a space, $, #, quote or backslash. chmod is explicit
+  # because umask only applies to a newly created file; overwriting an
+  # existing .env in place would otherwise keep its old, looser mode.
+  umask 077
+  cat >"$env_file" <<EOF
+# Generated by ./work.sh setup. Edit freely; re-run setup to regenerate.
+
+# --- Local guest accounts (Windows VM + Linux container) ---
+# Not domain-joined, so this password does not rotate.
+USERNAME=$(env_quote "$username")
+VM_PASSWORD=$(env_quote "$vm_password")
+
+# --- Corporate VPN ---
+# VPN_PASSWORD rotates on the company schedule (~45d). 2FA is prompted at connect.
+VPN_SERVER=$(env_quote "$vpn_server")
+VPN_PASSWORD=$(env_quote "$vpn_password")
+
+# Internal DNS, reachable only through the tunnel. Both guests use it while up.
+CORPORATE_DNS=$(env_quote "$corporate_dns")
+
+# Public ranges to route through the tunnel as well, comma-separated.
+# Corporate GitHub is IP-allowlisted, so its ranges belong here or git is blocked.
+VPN_EXTRA_ROUTES=$(env_quote "$extra_routes")
+
+# Internal-only hostname for ./work.sh test.
+VPN_TEST_HOST=$(env_quote "$test_host")
+EOF
+  chmod 600 "$env_file"
+
+  success ".env written."
+  echo ""
+  info "Next:"
+  info "  ./work.sh doctor    check prerequisites"
+  info "  ./work.sh up        build and start the containers"
+  info "  ./work.sh connect   bring up the VPN (prompts for 2FA)"
 }
 
 # --- Main dispatcher ---
@@ -479,8 +819,11 @@ case "${1:-help}" in
   connect)    shift; cmd_connect "$@" ;;
   disconnect) cmd_disconnect ;;
   reconnect)  shift; cmd_reconnect "$@" ;;
+  setup)      cmd_setup ;;
+  doctor)     cmd_doctor ;;
   status)     cmd_status ;;
-  up)         cmd_up ;;
+  test)       shift; cmd_test "$@" ;;
+  up)       cmd_up ;;
   down)       cmd_down ;;
   logs)       shift; cmd_logs "$@" ;;
   windows)    shift; cmd_windows "$@" ;;
