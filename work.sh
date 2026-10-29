@@ -29,6 +29,22 @@ info() { echo -e "${CYAN}$*${NC}"; }
 success() { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}$*${NC}"; }
 
+# First FreeRDP 3 binary on PATH. Distros package it as xfreerdp3 or xfreerdp;
+# both read the same /args-from: file, so every RDP option below behaves the same.
+rdp_client() {
+  local bin
+  for bin in xfreerdp3 xfreerdp; do
+    command -v "$bin" &>/dev/null && { printf '%s' "$bin"; return 0; }
+  done
+  return 1
+}
+
+# Random alphanumeric password for a local guest account. Alphanumeric only, so it
+# survives the dockur unattended install and RDP without quoting or escaping issues.
+gen_password() {
+  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20
+}
+
 load_env() {
   [ -f "$SCRIPT_DIR/.env" ] || die ".env file not found. Copy .env.example to .env and fill in your credentials."
   set -a
@@ -508,6 +524,8 @@ cmd_windows() {
     rdp)
       load_env
       require_env USERNAME VM_PASSWORD
+      local rdp_bin
+      rdp_bin=$(rdp_client) || die "No FreeRDP client found. Install the freerdp package (it provides xfreerdp3). ./work.sh windows web needs no client."
       prepare_windows_certs >/dev/null
 
       # Detect Hyprland display scale
@@ -550,7 +568,7 @@ cmd_windows() {
         [ -n "$rdp_scale" ] && printf '%s\n' "$rdp_scale"
       } >"$rdp_args"
 
-      nohup xfreerdp3 /args-from:"$rdp_args" >"$rdp_log" 2>&1 </dev/null &
+      nohup "$rdp_bin" /args-from:"$rdp_args" >"$rdp_log" 2>&1 </dev/null &
       rdp_pid=$!
       sleep 2
       rm -f "$rdp_args"
@@ -718,7 +736,7 @@ cmd_doctor() {
   check req "TUN (/dev/net/tun)" '[ -e /dev/net/tun ]'                 "Load the module: sudo modprobe tun." || fails=$((fails + 1))
 
   echo ""
-  check opt "xfreerdp3"          'command -v xfreerdp3'                "Only for ./work.sh windows rdp (package: freerdp). ./work.sh windows web works without it." || true
+  check opt "FreeRDP"            'command -v xfreerdp3 || command -v xfreerdp'  "Only for ./work.sh windows rdp (package: freerdp). ./work.sh windows web works without it." || true
   check opt "jq"                 'command -v jq'                       "Only for Hyprland RDP scale detection." || true
 
   echo ""
@@ -764,9 +782,12 @@ cmd_setup() {
   read -p "Local guest username (USERNAME) [your.username]: " username
   username="${username:-your.username}"
 
-  read -rsp "Local guest password (VM_PASSWORD), does not rotate [changeme]: " vm_password
+  read -rsp "Password for the Windows and Linux guests (VM_PASSWORD), Enter to auto-generate: " vm_password
   echo ""
-  vm_password="${vm_password:-changeme}"
+  if [ -z "$vm_password" ]; then
+    vm_password=$(gen_password)
+    info "Generated a random VM_PASSWORD. It is stored in .env; read it there if you log in to Windows directly."
+  fi
 
   read -p "VPN gateway IP (VPN_SERVER) [IT]: " vpn_server
   read -rsp "VPN password (VPN_PASSWORD), rotates ~45d, Enter to fill later: " vpn_password
