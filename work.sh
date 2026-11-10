@@ -2,13 +2,54 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMPOSE="docker compose -f $SCRIPT_DIR/docker-compose.yml"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 VM_SUBNET="172.30.0.0/24"   # dockurr's bridge inside work-vpn
 VPN_RUNTIME_CONF="/run/snx-rs-connect.conf"
 
-# GitHub's published ranges (api.github.com/meta). Corporate GitHub is
-# IP-allowlisted to company egress, so these route through the tunnel by default.
+# Corporate GitHub is IP-allowlisted to company egress, so GitHub routes through
+# the tunnel by default: "github" in VPN_EXTRA_ROUTES expands at connect time to
+# the live ranges from api.github.com/meta. This fixed list is only the fallback
+# when that fetch fails; it misses GitHub's regional Azure addresses.
 GITHUB_ROUTES="192.30.252.0/22,185.199.108.0/22,140.82.112.0/20,143.55.64.0/20"
+GITHUB_META="https://api.github.com/meta"
+
+# --- Paths ---
+# The repo holds only code. Everything else lives outside it, grouped by how
+# often you touch it (./work.sh paths prints them):
+#   WORK_CONFIG_DIR  env, certificates/, ssh/   edited now and then, mode 0700
+#   WORK_SHARED_DIR  exchange folder for the host and both guests
+#   WORK_DATA_DIR    windows/ (VM disk), linux/ (container home), state/
+# WORK_CONFIG_DIR can be overridden from the environment; the other two from
+# the environment or the env file.
+WORK_CONFIG_DIR="${WORK_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/work}"
+WORK_ENV="$WORK_CONFIG_DIR/env"
+
+set_paths() {
+  WORK_DATA_DIR="${WORK_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/work}"
+  WORK_SHARED_DIR="${WORK_SHARED_DIR:-$HOME/Work/shared}"
+  CERT_DIR="$WORK_CONFIG_DIR/certificates"   # CAs trusted by both guests
+  GUEST_SSH_DIR="$WORK_CONFIG_DIR/ssh"       # files copied into ~/.ssh of both guests
+  # Windows sync: the host pushes certificates, keys and SSO credentials into
+  # the VM over SSH, so none of them ever lands in the shared folder.
+  WORK_STATE_DIR="$WORK_DATA_DIR/state"      # generated, never mounted into a guest
+  WIN_SSH_KEY="$WORK_STATE_DIR/windows_ed25519"
+  WIN_KNOWN_HOSTS="$WORK_STATE_DIR/known_hosts"
+  WIN_SYNCED="$WORK_STATE_DIR/windows-synced"   # set after the first successful sync
+  # docker-compose.yml mounts these.
+  export WORK_CONFIG_DIR WORK_DATA_DIR WORK_SHARED_DIR
+}
+set_paths
+
+# Contracted for display: /home/me/.config/work -> ~/.config/work
+tilde() {
+  printf '%s' "${1/#$HOME/\~}"
+}
+
+WIN_SSH_PORT=2222                    # published on 127.0.0.1 by the vpn service
+WIN_SSH_WAIT=300                     # seconds to wait for Windows to boot
+# Windows' ssh shell is cmd.exe. Read the whole script from stdin and run it as
+# one block; "powershell -Command -" runs stdin line by line and breaks blocks.
+WIN_PS='powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([Console]::In.ReadToEnd()))"'
 
 # Runs inside work-vpn with $corporate_dns set. Without the tunnel the
 # corporate resolver is unreachable, so a leftover redirect kills Windows DNS.
@@ -50,10 +91,25 @@ gen_password() {
 }
 
 load_env() {
-  [ -f "$SCRIPT_DIR/.env" ] || die ".env file not found. Copy .env.example to .env and fill in your credentials."
+  if [ ! -f "$WORK_ENV" ]; then
+    [ -f "$SCRIPT_DIR/.env" ] && die "Found the old layout (.env in the repo). Run: ./work.sh migrate"
+    die "$(tilde "$WORK_ENV") not found. Run: ./work.sh setup"
+  fi
   set -a
-  source "$SCRIPT_DIR/.env"
+  source "$WORK_ENV"
   set +a
+  set_paths
+}
+
+# docker compose with the env loaded (it interpolates USERNAME, VM_PASSWORD and
+# the paths). Bind-mount sources are created here, since Docker would create
+# missing ones owned by root.
+compose() {
+  load_env
+  mkdir -p "$WORK_DATA_DIR/windows" "$WORK_DATA_DIR/linux" "$WORK_SHARED_DIR"
+  mkdir -p -m 700 "$WORK_CONFIG_DIR"
+  mkdir -p "$CERT_DIR" "$GUEST_SSH_DIR"
+  docker compose -f "$COMPOSE_FILE" "$@"
 }
 
 # Fail with a named error instead of letting an empty credential reach a guest
@@ -65,7 +121,7 @@ require_env() {
     [ -n "${!var:-}" ] || missing+=("$var")
   done
   if [ ${#missing[@]} -gt 0 ]; then
-    die "Missing in .env: ${missing[*]}. See .env.example."
+    die "Missing in $(tilde "$WORK_ENV"): ${missing[*]}. See .env.example in the repo."
   fi
 }
 
@@ -79,11 +135,45 @@ vpn_connected() {
   docker exec work-vpn ip link show snx-tun &>/dev/null 2>&1
 }
 
+# GitHub's current IPv4 ranges for web, api and git, comma-separated. GitHub
+# keeps adding regional addresses (github.com resolves to one in Azure from
+# Europe), and any it misses leaves through the home address and hits the IP
+# allow list. The meta arrays hold only strings, so no JSON parser is needed.
+github_routes() {
+  local routes
+  routes=$(curl -fsS --max-time 10 "$GITHUB_META" 2>/dev/null | tr -d ' \n' |
+    grep -oE '"(web|api|git)":\[[^]]*\]' | grep -oE '[0-9]+(\.[0-9]+){3}/[0-9]+' |
+    sort -u | paste -sd, -) || true
+  if [ -z "$routes" ]; then
+    warn "Could not fetch GitHub's ranges from $GITHUB_META; using the built-in list, which misses its regional addresses." >&2
+    routes="$GITHUB_ROUTES"
+  fi
+  printf '%s' "$routes"
+}
+
+# VPN_EXTRA_ROUTES with "github" expanded. Entries are validated because they
+# reach ip route inside work-vpn.
+extra_routes() {
+  local item out=""
+  for item in ${VPN_EXTRA_ROUTES//,/ }; do
+    if [ "$item" = github ]; then
+      item=$(github_routes)
+    elif ! [[ "$item" =~ ^[0-9]+(\.[0-9]+){3}(/[0-9]+)?$ ]]; then
+      warn "VPN_EXTRA_ROUTES: '$item' is neither an IPv4 range nor 'github'; skipped." >&2
+      continue
+    fi
+    out="${out:+$out,}$item"
+  done
+  printf '%s' "$out"
+}
+
 # Set up NAT + DNS forwarding inside work-vpn
 setup_nat() {
+  local routes
   load_env
   require_env CORPORATE_DNS
-  docker exec -i work-vpn sh -s -- "$CORPORATE_DNS" "$VM_SUBNET" "${VPN_EXTRA_ROUTES:-}" <<'EOF'
+  routes=$(extra_routes)
+  docker exec -i work-vpn sh -s -- "$CORPORATE_DNS" "$VM_SUBNET" "$routes" <<'EOF'
 set -e
 corporate_dns="$1"
 vm_subnet="$2"
@@ -105,6 +195,11 @@ iptables -C FORWARD -i docker -o snx-tun -j ACCEPT 2>/dev/null ||
   iptables -A FORWARD -i docker -o snx-tun -j ACCEPT
 iptables -C FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
   iptables -A FORWARD -i snx-tun -o docker -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# dockur forwards every port addressed to this namespace to the VM, the tunnel
+# address included. Keep the corporate side from reaching the VM's sshd.
+iptables -C FORWARD -i snx-tun -o docker -p tcp --dport 22 -m state --state NEW -j DROP 2>/dev/null ||
+  iptables -I FORWARD -i snx-tun -o docker -p tcp --dport 22 -m state --state NEW -j DROP
 
 # snx-rs consults its own table ahead of main, and its 172.16.0.0/12 route
 # covers both the Docker network and the VM bridge. Send those back to main by
@@ -165,40 +260,350 @@ EOF"
   fi
 }
 
-prepare_windows_certs() {
-  local src_dir="$SCRIPT_DIR/certificates"
-  local dst_dir="$SCRIPT_DIR/shared/certificates"
-  local cert_count=0
-  local file
+# --- Windows sync over SSH ---
 
-  mkdir -p "$src_dir" "$dst_dir"
-
-  rm -f "$dst_dir"/*.crt "$dst_dir"/*.cer "$dst_dir"/*.pem
-
-  shopt -s nullglob
-  for file in "$src_dir"/*.crt "$src_dir"/*.cer "$src_dir"/*.pem; do
-    [ -f "$file" ] || continue
-    cp -f "$file" "$dst_dir/"
-    cert_count=$((cert_count + 1))
-  done
-  shopt -u nullglob
-
-  cat > "$dst_dir/import-certs.ps1" <<'EOF'
-$certDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$certFiles = Get-ChildItem -Path $certDir -File | Where-Object { $_.Extension -in '.crt', '.cer', '.pem' }
-
-if (-not $certFiles) {
-  Write-Host 'No certificate files found.'
-  exit 0
+# Run a command in the Windows VM with the bootstrap key: an elevated session
+# as the user. Any SSH login (key or password) is a network logon, so it cannot
+# write Credential Manager; win_user_script works around that with a task.
+win_ssh() {
+  ssh -p "$WIN_SSH_PORT" -o HostKeyAlias=work-windows \
+    -o UserKnownHostsFile="$WIN_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=5 -o LogLevel=ERROR \
+    -i "$WIN_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+    "$USERNAME@127.0.0.1" "$@"
 }
 
-foreach ($certFile in $certFiles) {
-  Import-Certificate -FilePath $certFile.FullName -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-  Write-Host "Imported $($certFile.Name)"
+# Run the PowerShell script on stdin in the Windows VM.
+win_ps() {
+  win_ssh "$WIN_PS"
+}
+
+win_ssh_ready() {
+  win_ssh exit </dev/null >/dev/null 2>&1
+}
+
+# Wait until Windows has booted far enough to accept SSH.
+win_wait_ssh() {
+  local waited=0
+  win_ssh_ready && return 0
+  info "Waiting for Windows to accept SSH (up to $((WIN_SSH_WAIT / 60)) min)..."
+  while [ "$waited" -lt "$WIN_SSH_WAIT" ]; do
+    sleep 5
+    waited=$((waited + 5))
+    win_ssh_ready && return 0
+  done
+  return 1
+}
+
+# Comma-separated SSO sites, validated because they are spliced into
+# PowerShell. Defaults to every host under AD_DOMAIN.
+sso_sites() {
+  local sites="${SSO_SITES:-*.${AD_DOMAIN}}"
+  sites="${sites// /}"
+  [[ "$sites" =~ ^[A-Za-z0-9.*-]+(,[A-Za-z0-9.*-]+)*$ ]] ||
+    die "SSO_SITES must be comma-separated host patterns like *.corp.example.com, got: $sites"
+  printf '%s' "$sites"
+}
+
+# Machine-wide part, run elevated: trust CERT_DIR (self-signed into Root, the
+# rest into Intermediate), let Edge and Chrome answer Negotiate/NTLM for the
+# SSO sites, and resync the clock (Kerberos rejects >5 min of skew).
+win_machine_script() {
+  local file sites=""
+  [ -n "${AD_DOMAIN:-}" ] && sites=$(sso_sites)
+
+  echo '$ErrorActionPreference = "Stop"'
+  echo '$certs = @('
+  shopt -s nullglob
+  for file in "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*.pem; do
+    printf "  '%s'\n" "$(base64 -w0 "$file")"
+  done
+  shopt -u nullglob
+  echo ')'
+  printf "\$sites = '%s'\n" "$sites"
+  cat <<'EOF'
+foreach ($b64 in $certs) {
+  $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($b64))
+  $storeName = if ($cert.Subject -eq $cert.Issuer) { 'Root' } else { 'CA' }
+  $store = [System.Security.Cryptography.X509Certificates.X509Store]::new($storeName, 'LocalMachine')
+  $store.Open('ReadWrite')
+  try {
+    if ($store.Certificates.Find('FindByThumbprint', $cert.Thumbprint, $false).Count -eq 0) {
+      $store.Add($cert)
+      Write-Output "  certificate added ($storeName): $($cert.Subject)"
+    }
+  } finally { $store.Close() }
+}
+Write-Output "  certificates: $($certs.Count) in sync"
+
+if ($sites) {
+  foreach ($key in 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKLM:\SOFTWARE\Policies\Google\Chrome') {
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+    Set-ItemProperty -Path $key -Name AuthServerAllowlist -Value $sites -Type String
+  }
+  Write-Output "  browser policy: Edge + Chrome allow silent login to $sites"
+}
+
+try {
+  Start-Service w32time
+  w32tm /resync /force | Out-Null
+} catch { }
+EOF
+}
+
+# Files directly in GUEST_SSH_DIR (keys, config, known_hosts), one per line,
+# for ~/.ssh in both guests. Names are spliced into PowerShell, so validated.
+guest_ssh_files() {
+  local name
+  [ -d "$GUEST_SSH_DIR" ] || return 0
+  find "$GUEST_SSH_DIR" -maxdepth 1 -type f -printf '%f\n' | sort | while read -r name; do
+    if [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      printf '%s\n' "$name"
+    else
+      warn "Skipping ssh/$name: only letters, digits, '.', '_' and '-' are allowed in names." >&2
+    fi
+  done
+}
+
+# Copy GUEST_SSH_DIR into ~/.ssh in the Linux container. Through docker exec as
+# the container user, so ownership is right whatever the host uid is.
+linux_sync_ssh() {
+  local names tries=0
+  load_env
+  container_running work-linux || return 0
+  names=$(guest_ssh_files)
+  [ -n "$names" ] || return 0
+
+  # The entrypoint creates the user; give a just-started container a moment.
+  until docker exec work-linux id -u "$USERNAME" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 10 ] || { warn "Linux user $USERNAME not ready; SSH keys not copied."; return 1; }
+    sleep 1
+  done
+
+  printf '%s\n' "$names" | tar -C "$GUEST_SSH_DIR" -cf - -T - |
+    docker exec -i -u "$USERNAME" work-linux sh -c '
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh &&
+      tar -C ~/.ssh --no-same-owner -xf - &&
+      find ~/.ssh -maxdepth 1 -type f ! -name "*.pub" -exec chmod 600 {} +' ||
+    { warn "Could not copy SSH keys into the Linux container."; return 1; }
+  echo -e "  ${DIM}linux ssh: $(printf '%s ' $names)${NC}"
+}
+
+# Store the AD credential in Credential Manager for each SSO site, so Windows
+# answers their login challenge itself. Runs inside the credential task (see
+# win_user_script) and reports through a .log next to itself.
+win_cred_script() {
+  local user="$1" password="$2" sites="$3" site
+
+  echo '$ErrorActionPreference = "Stop"'
+  echo '$log = [IO.Path]::ChangeExtension($PSCommandPath, ".log")'
+  echo 'try {'
+  printf "\$user = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n" "$(printf '%s' "$user" | base64 -w0)"
+  printf "\$pass = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n" "$(printf '%s' "$password" | base64 -w0)"
+  echo '$targets = @('
+  for site in ${sites//,/ }; do
+    printf "  '%s'\n" "$site"
+  done
+  echo ')'
+  cat <<'EOF'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class WorkCred {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct CREDENTIAL {
+    public int Flags; public int Type; public string TargetName; public string Comment;
+    public long LastWritten; public int CredentialBlobSize; public IntPtr CredentialBlob;
+    public int Persist; public int AttributeCount; public IntPtr Attributes;
+    public string TargetAlias; public string UserName;
+  }
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool CredWrite(ref CREDENTIAL credential, int flags);
+  public static void Write(string target, string user, string pass) {
+    var c = new CREDENTIAL();
+    c.Type = 2;     // CRED_TYPE_DOMAIN_PASSWORD: used by Negotiate, Kerberos, NTLM
+    c.Persist = 2;  // CRED_PERSIST_LOCAL_MACHINE
+    c.TargetName = target;
+    c.UserName = user;
+    c.Comment = "Managed by work.sh";
+    byte[] blob = System.Text.Encoding.Unicode.GetBytes(pass);
+    c.CredentialBlobSize = blob.Length;
+    c.CredentialBlob = Marshal.AllocCoTaskMem(blob.Length);
+    try {
+      Marshal.Copy(blob, 0, c.CredentialBlob, blob.Length);
+      if (!CredWrite(ref c, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    } finally {
+      Marshal.FreeCoTaskMem(c.CredentialBlob);
+    }
+  }
+}
+'@
+  foreach ($t in $targets) { [WorkCred]::Write($t, $user, $pass) }
+  $result = "  credentials: $user stored for $($targets -join ', ')"
+} catch {
+  $result = "error: $_"
+}
+# Write then rename, so the waiting side never reads a partial file.
+Set-Content -Path "$log.tmp" -Value $result
+Move-Item -Path "$log.tmp" -Destination $log -Force
+EOF
+}
+
+# User part, run over the key session: copy GUEST_SSH_DIR into ~\.ssh, then
+# store the SSO credentials. An SSH login is a network logon, which has no
+# Credential Manager, so that part runs as a one-shot scheduled task logged on
+# with VM_PASSWORD; the task and its script (in the user-only %TEMP%) are
+# removed afterwards. Secrets travel base64-encoded inside the script on ssh's
+# stdin. Empty sites skip the credential part.
+win_user_script() {
+  local user="$1" password="$2" sites="$3" vm_password="$4" name
+
+  echo '$ErrorActionPreference = "Stop"'
+  echo '$sshFiles = [ordered]@{'
+  while read -r name; do
+    [ -n "$name" ] && printf "  '%s' = '%s'\n" "$name" "$(base64 -w0 "$GUEST_SSH_DIR/$name")"
+  done <<<"$(guest_ssh_files)"
+  echo '}'
+  cat <<'EOF'
+if ($sshFiles.Count) {
+  $dir = Join-Path $env:USERPROFILE '.ssh'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  foreach ($name in $sshFiles.Keys) {
+    [IO.File]::WriteAllBytes((Join-Path $dir $name), [Convert]::FromBase64String($sshFiles[$name]))
+  }
+  Write-Output "  windows ssh: $($sshFiles.Keys -join ' ')"
 }
 EOF
 
-  printf '%s\n' "$cert_count"
+  [ -n "$sites" ] || return 0
+  printf "\$credScript = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n" \
+    "$(win_cred_script "$user" "$password" "$sites" | base64 -w0)"
+  printf "\$vmPass = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))\n" \
+    "$(printf '%s' "$vm_password" | base64 -w0)"
+  cat <<'EOF'
+$task = 'work.sh credentials'
+$file = Join-Path $env:TEMP "work-cred-$([guid]::NewGuid()).ps1"
+$log = [IO.Path]::ChangeExtension($file, '.log')
+try {
+  [IO.File]::WriteAllText($file, $credScript)
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$file`""
+  Register-ScheduledTask -TaskName $task -Action $action -Force `
+    -User "$env:COMPUTERNAME\$env:USERNAME" -Password $vmPass | Out-Null
+  Start-ScheduledTask -TaskName $task
+  $deadline = (Get-Date).AddSeconds(60)
+  while (-not (Test-Path $log)) {
+    if ((Get-Date) -gt $deadline) { throw 'the credential task did not finish within 60 s' }
+    Start-Sleep -Milliseconds 300
+  }
+  $result = (Get-Content -Path $log -Raw).TrimEnd()
+  if ($result -like 'error:*') { throw $result }
+  Write-Output $result
+} finally {
+  Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-Item -Path $file, $log, "$log.tmp" -Force -ErrorAction SilentlyContinue
+}
+EOF
+}
+
+# Push certificates, browser policy, SSH keys and SSO credentials into the
+# Windows VM. Idempotent; runs on every start so a rotated password is picked up.
+windows_sync() {
+  load_env
+  require_env USERNAME VM_PASSWORD
+  container_running work-windows || die "Windows is not running. Run: ./work.sh windows start"
+
+  if [ ! -f "$WIN_SSH_KEY" ]; then
+    warn "Windows sync is not set up yet. Run once: ./work.sh windows bootstrap"
+    return 1
+  fi
+
+  # Before the first successful sync, a closed port most likely means the
+  # bootstrap has not been run inside Windows. Do not wait minutes for it.
+  if [ -f "$WIN_SYNCED" ]; then
+    win_wait_ssh || { warn "Windows did not accept SSH within $((WIN_SSH_WAIT / 60)) min. Retry with: ./work.sh windows sync"; return 1; }
+  elif ! win_ssh_ready; then
+    warn "Windows does not accept the sync key yet. If it is still booting, retry with: ./work.sh windows sync"
+    warn "Otherwise finish the one-time setup: ./work.sh windows bootstrap"
+    return 1
+  fi
+
+  info "Syncing Windows..."
+  win_machine_script | win_ps || { warn "Machine sync (certificates, browser policy) failed."; return 1; }
+
+  local sites="" user="" password=""
+  if [ -z "${AD_DOMAIN:-}" ]; then
+    echo -e "  ${DIM}credentials: skipped, AD_DOMAIN is not set in $(tilde "$WORK_ENV")${NC}"
+  elif [ -z "${AD_PASSWORD:-${VPN_PASSWORD:-}}" ]; then
+    echo -e "  ${DIM}credentials: skipped, neither AD_PASSWORD nor VPN_PASSWORD is set${NC}"
+  else
+    sites=$(sso_sites) || return 1
+    user="${AD_USER:-$USERNAME@$AD_DOMAIN}"
+    password="${AD_PASSWORD:-$VPN_PASSWORD}"
+  fi
+
+  if [ -n "$sites" ] || [ -n "$(guest_ssh_files 2>/dev/null)" ]; then
+    win_user_script "$user" "$password" "$sites" "$VM_PASSWORD" |
+      win_ps || { warn "User sync (SSH keys, credentials) failed."; return 1; }
+  fi
+
+  touch "$WIN_SYNCED"
+  success "Windows synced."
+}
+
+# One-time setup inside Windows: install OpenSSH Server and trust the host's
+# sync key. Printed as one command to paste into an elevated PowerShell, so
+# nothing goes through the shared folder.
+windows_bootstrap() {
+  load_env
+  require_env USERNAME
+  command -v ssh-keygen >/dev/null || die "ssh-keygen not found. Install openssh."
+
+  mkdir -p -m 700 "$WORK_STATE_DIR"
+  [ -f "$WIN_SSH_KEY" ] || ssh-keygen -q -t ed25519 -N '' -C "work.sh windows sync" -f "$WIN_SSH_KEY"
+
+  local pubkey script encoded
+  pubkey=$(cat "$WIN_SSH_KEY.pub")
+  script=$(cat <<EOF
+\$ErrorActionPreference = 'Stop'
+\$cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+if (\$cap.State -ne 'Installed') {
+  Write-Host 'Installing OpenSSH Server (takes a minute)...'
+  Add-WindowsCapability -Online -Name \$cap.Name | Out-Null
+}
+Set-Service -Name sshd -StartupType Automatic
+Start-Service sshd
+if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+}
+# Administrators authenticate against this file, not ~\\.ssh\\authorized_keys.
+\$keys = Join-Path \$env:ProgramData 'ssh\\administrators_authorized_keys'
+\$pubkey = '$pubkey'
+if (-not ((Test-Path \$keys) -and (Select-String -Path \$keys -SimpleMatch \$pubkey -Quiet))) {
+  Add-Content -Path \$keys -Value \$pubkey -Encoding ascii
+}
+icacls.exe \$keys /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
+Write-Host 'Done. On the host, run: ./work.sh windows sync'
+EOF
+  )
+  # -EncodedCommand takes base64 of UTF-16LE.
+  encoded=$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+  local cmd="powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+
+  echo -e "${BOLD}One-time Windows setup${NC}"
+  echo ""
+  echo "In Windows, open PowerShell as Administrator and paste this command."
+  echo "It installs OpenSSH Server and trusts this host's sync key ($(tilde "$WIN_SSH_KEY").pub)."
+  if command -v wl-copy >/dev/null && printf '%s' "$cmd" | wl-copy 2>/dev/null; then
+    success "Copied to the clipboard. Paste it into the RDP session."
+  else
+    echo ""
+    echo "$cmd"
+  fi
+  echo ""
+  info "Then run: ./work.sh windows sync"
 }
 
 # --- Commands ---
@@ -226,7 +631,7 @@ cmd_connect() {
   # Ensure VPN container is up
   if ! container_running work-vpn; then
     info "Starting VPN container..."
-    $COMPOSE up -d vpn
+    compose up -d vpn
     sleep 2
   fi
 
@@ -369,7 +774,7 @@ cmd_test() {
 
   load_env
   host="${1:-${VPN_TEST_HOST:-}}"
-  [ -n "$host" ] || die "No host to test. Pass one (./work.sh test <host>) or set VPN_TEST_HOST in .env."
+  [ -n "$host" ] || die "No host to test. Pass one (./work.sh test <host>) or set VPN_TEST_HOST in $(tilde "$WORK_ENV")."
 
   container_running work-vpn || die "work-vpn is not running. Run: ./work.sh up"
   vpn_connected || die "VPN tunnel is down. Run: ./work.sh connect"
@@ -445,16 +850,18 @@ cmd_up() {
   load_env
   require_env USERNAME VM_PASSWORD
   info "Starting all containers..."
-  $COMPOSE up -d --build
+  compose up -d --build
   configure_linux_dns
+  linux_sync_ssh || true
   success "All containers started."
+  windows_sync || true
   echo ""
   cmd_status
 }
 
 cmd_down() {
   info "Stopping all containers..."
-  $COMPOSE down
+  compose down
   success "All containers stopped."
 }
 
@@ -478,15 +885,15 @@ vm_start() {
   # Ensure VPN container is up first (VMs depend on it for networking)
   if ! container_running work-vpn; then
     info "Starting VPN container..."
-    $COMPOSE up -d vpn
+    compose up -d vpn
     sleep 2
   fi
 
   info "Starting $vm..."
   if [ "$vm" = "linux" ]; then
-    $COMPOSE up -d --build "$vm"
+    compose up -d --build "$vm"
   else
-    $COMPOSE up -d "$vm"
+    compose up -d "$vm"
   fi
   success "$vm started."
 }
@@ -496,7 +903,7 @@ vm_start() {
 vm_stop() {
   local vm="$1"
   info "Stopping $vm gracefully..."
-  $COMPOSE stop "$vm"
+  compose stop "$vm"
   success "$vm stopped."
 }
 
@@ -516,21 +923,22 @@ cmd_windows() {
   local action="${1:-help}"
   case "$action" in
     start)
-      prepare_windows_certs >/dev/null
       vm_start windows
+      windows_sync || true
       ;;
     stop)    vm_stop windows ;;
     restart)
-      prepare_windows_certs >/dev/null
       vm_restart windows
+      windows_sync || true
       ;;
+    sync|certs) windows_sync ;;
+    bootstrap)  windows_bootstrap ;;
     logs)    vm_logs work-windows ;;
     rdp)
       load_env
       require_env USERNAME VM_PASSWORD
       local rdp_bin
       rdp_bin=$(rdp_client) || die "No FreeRDP client found. Install the freerdp package (it provides xfreerdp3). ./work.sh windows web needs no client."
-      prepare_windows_certs >/dev/null
 
       # Detect Hyprland display scale
       local rdp_scale=""
@@ -588,14 +996,6 @@ cmd_windows() {
       disown "$rdp_pid" 2>/dev/null || true
       success "RDP launched. Logs: $rdp_log"
       ;;
-    certs)
-      local cert_count
-      cert_count=$(prepare_windows_certs)
-      info "Prepared ${cert_count} certificate(s) for Windows in \\\\172.30.0.1\\Data\\certificates"
-      echo ""
-      echo "Run this in an elevated PowerShell inside Windows:"
-      echo "  PowerShell -ExecutionPolicy Bypass -File \\\\172.30.0.1\\Data\\certificates\\import-certs.ps1"
-      ;;
     web)
       info "Opening Windows web viewer..."
       xdg-open "http://127.0.0.1:8007" 2>/dev/null &
@@ -607,7 +1007,8 @@ cmd_windows() {
       echo "  ./work.sh windows stop     Graceful shutdown"
       echo "  ./work.sh windows restart  Stop + start"
       echo "  ./work.sh windows rdp      Open RDP session"
-      echo "  ./work.sh windows certs    Prepare internal certs for Windows"
+      echo "  ./work.sh windows sync     Push certificates + SSO credentials (runs on start)"
+      echo "  ./work.sh windows bootstrap  One-time: enable SSH in Windows for sync"
       echo "  ./work.sh windows web      Open web viewer in browser"
       echo "  ./work.sh windows logs     Tail container logs"
       ;;
@@ -622,6 +1023,7 @@ cmd_linux() {
     start)
       vm_start linux
       configure_linux_dns
+      linux_sync_ssh || true
       ;;
     stop)
       vm_stop linux
@@ -629,6 +1031,7 @@ cmd_linux() {
     restart)
       vm_restart linux
       configure_linux_dns
+      linux_sync_ssh || true
       ;;
     logs)
       vm_logs work-linux
@@ -638,6 +1041,7 @@ cmd_linux() {
         info "Linux container is not running, starting it..."
         vm_start linux
         configure_linux_dns
+        linux_sync_ssh || true
       fi
       load_env
       require_env USERNAME
@@ -651,9 +1055,10 @@ cmd_linux() {
       info "Snapshotting host Omarchy config..."
       "$SCRIPT_DIR/linux-image/sync-host-config.sh"
       info "Rebuilding the Linux image..."
-      $COMPOSE build linux
-      $COMPOSE up -d --force-recreate linux
+      compose build linux
+      compose up -d --force-recreate linux
       configure_linux_dns
+      linux_sync_ssh || true
       success "Linux container rebuilt. Configs already in your home are kept; delete one to get the fresh copy."
       ;;
     *)
@@ -675,8 +1080,13 @@ cmd_help() {
   echo -e "${BOLD}work.sh${NC} — Corporate remote environment manager"
   echo ""
   echo -e "${BOLD}Setup:${NC}"
-  echo "  ./work.sh setup              Create .env interactively (first run)"
+  echo "  ./work.sh setup              Create the env file interactively (first run)"
   echo "  ./work.sh doctor             Check prerequisites (Docker, KVM, tun, tools)"
+  echo "  ./work.sh migrate            Move an old in-repo layout to the folders below"
+  echo ""
+  echo -e "${BOLD}Folders:${NC}"
+  echo "  ./work.sh paths              Show where config, certificates, keys and data live"
+  echo "  ./work.sh open <what>        Open a folder (config|certs|ssh|shared|data)"
   echo ""
   echo -e "${BOLD}VPN:${NC}"
   echo "  ./work.sh connect [--debug]  Connect VPN (prompts for 2FA)"
@@ -691,7 +1101,7 @@ cmd_help() {
   echo "  ./work.sh logs [vpn|windows|linux]  Tail container logs"
   echo ""
   echo -e "${BOLD}VMs:${NC}"
-  echo "  ./work.sh windows <cmd>      Manage Windows VM (start|stop|restart|rdp|web|logs)"
+  echo "  ./work.sh windows <cmd>      Manage Windows VM (start|stop|restart|rdp|sync|bootstrap|web|logs)"
   echo "  ./work.sh linux <cmd>        Manage Linux container (start|stop|restart|shell|rebuild|logs)"
   echo ""
   echo -e "${BOLD}Examples:${NC}"
@@ -700,6 +1110,150 @@ cmd_help() {
   echo "  ./work.sh windows rdp        Open RDP session"
   echo "  ./work.sh linux shell        Open shell in Arch container"
   echo "  ./work.sh status             Quick overview of everything"
+}
+
+# --- Folders ---
+
+cmd_paths() {
+  [ -f "$WORK_ENV" ] && load_env
+  local row='  %-9s %-34s %s\n'
+  echo -e "${BOLD}Folders${NC}"
+  echo ""
+  printf "$row" "env"     "$(tilde "$WORK_ENV")"            "settings and passwords (mode 0600)"
+  printf "$row" "certs"   "$(tilde "$CERT_DIR")"            "CAs trusted by both guests"
+  printf "$row" "ssh"     "$(tilde "$GUEST_SSH_DIR")"       "copied into ~/.ssh of both guests"
+  printf "$row" "shared"  "$(tilde "$WORK_SHARED_DIR")"     "mounted in both guests (Linux: ~/Shared)"
+  printf "$row" "data"    "$(tilde "$WORK_DATA_DIR")"       "windows/ disk, linux/ home, state/"
+  printf "$row" "code"    "$(tilde "$SCRIPT_DIR")"          "this repo"
+  echo ""
+  echo -e "${DIM}Certificates and keys reach the guests on every start, or now with:"
+  echo -e "  ./work.sh windows sync   ./work.sh linux restart${NC}"
+  if legacy_items >/dev/null; then
+    echo ""
+    warn "Old in-repo layout found. Run: ./work.sh migrate"
+  fi
+}
+
+cmd_open() {
+  [ -f "$WORK_ENV" ] && load_env
+  local dir
+  case "${1:-}" in
+    config) dir="$WORK_CONFIG_DIR" ;;
+    certs | certificates) dir="$CERT_DIR" ;;
+    ssh) dir="$GUEST_SSH_DIR" ;;
+    shared) dir="$WORK_SHARED_DIR" ;;
+    data) dir="$WORK_DATA_DIR" ;;
+    *) die "Usage: ./work.sh open config|certs|ssh|shared|data" ;;
+  esac
+  mkdir -p "$dir"
+  command -v xdg-open >/dev/null || { echo "$dir"; return; }
+  xdg-open "$dir" >/dev/null 2>&1 &
+  info "Opened $(tilde "$dir")"
+}
+
+# Old in-repo items still present, one per line. Fails when there are none.
+legacy_items() {
+  local item found=1
+  for item in .env certificates .work windows linux shared; do
+    if [ -e "$SCRIPT_DIR/$item" ]; then
+      printf '%s\n' "$item"
+      found=0
+    fi
+  done
+  return $found
+}
+
+# Move one item to its new home. Refuses to overwrite: an empty directory left
+# at the destination is replaced, anything else stops the migration.
+migrate_move() {
+  local src="$1" dest="$2" sudo=""
+  [ -e "$src" ] || return 0
+  if [ -d "$dest" ] && [ -z "$(ls -A "$dest" 2>/dev/null)" ]; then
+    rmdir "$dest"
+  elif [ -e "$dest" ]; then
+    die "$(tilde "$dest") already exists. Move $(tilde "$src") by hand, then re-run ./work.sh migrate."
+  fi
+  mkdir -p "$(dirname "$dest")"
+  # Moving a directory to a new parent needs write access to it; windows/ is
+  # owned by root (the VM container writes it).
+  if [ -d "$src" ] && [ ! -w "$src" ]; then
+    sudo="sudo"
+  fi
+  $sudo mv "$src" "$dest" || die "Could not move $(tilde "$src")."
+  printf '  %bmoved%b   %s -> %s\n' "$GREEN" "$NC" "$(tilde "$src")" "$(tilde "$dest")"
+}
+
+cmd_migrate() {
+  local items ans
+  if ! items=$(legacy_items); then
+    success "Nothing to migrate; already on the new layout."
+    cmd_paths
+    return 0
+  fi
+
+  # Read the old env for the container user name and so docker compose can
+  # interpolate the file while stopping the containers.
+  if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+    set_paths
+  fi
+
+  echo -e "${BOLD}Move to the new layout${NC}"
+  echo ""
+  echo "  .env           -> $(tilde "$WORK_ENV")"
+  echo "  certificates/  -> $(tilde "$CERT_DIR")"
+  echo "  shared/id_*    -> $(tilde "$GUEST_SSH_DIR")   (private keys out of the shared folder)"
+  echo "  shared/        -> $(tilde "$WORK_SHARED_DIR")"
+  echo "  windows/       -> $(tilde "$WORK_DATA_DIR")/windows   (sudo: owned by root)"
+  echo "  linux/         -> $(tilde "$WORK_DATA_DIR")/linux"
+  echo "  .work/         -> $(tilde "$WORK_STATE_DIR")"
+  echo ""
+  echo "Found: $(printf '%s ' $items)"
+  warn "This stops all containers, the VPN included."
+  read -p "Continue? [y/N] " ans
+  case "$ans" in
+    y | Y) ;;
+    *) info "Nothing changed."; return 0 ;;
+  esac
+
+  info "Stopping containers..."
+  docker compose -f "$COMPOSE_FILE" down || die "Could not stop the containers."
+
+  echo ""
+  mkdir -p -m 700 "$WORK_CONFIG_DIR"
+  mkdir -p -m 700 "$GUEST_SSH_DIR"
+  migrate_move "$SCRIPT_DIR/certificates" "$CERT_DIR"
+  migrate_move "$SCRIPT_DIR/.work" "$WORK_STATE_DIR"
+
+  if [ -d "$SCRIPT_DIR/shared" ]; then
+    local key
+    for key in "$SCRIPT_DIR"/shared/id_*; do
+      [ -f "$key" ] && migrate_move "$key" "$GUEST_SSH_DIR/$(basename "$key")"
+    done
+    # Generated copies from the old shared-folder certificate import.
+    if [ -d "$SCRIPT_DIR/shared/certificates" ] &&
+      [ -z "$(find "$SCRIPT_DIR/shared/certificates" -type f ! -name '*.crt' ! -name '*.cer' ! -name '*.pem' ! -name 'import-certs.ps1')" ]; then
+      rm -rf "$SCRIPT_DIR/shared/certificates"
+      printf '  %bremoved%b shared/certificates (old copies)\n' "$GREEN" "$NC"
+    fi
+    rm -f "$SCRIPT_DIR/shared/.gitkeep"
+    migrate_move "$SCRIPT_DIR/shared" "$WORK_SHARED_DIR"
+  fi
+
+  migrate_move "$SCRIPT_DIR/windows" "$WORK_DATA_DIR/windows"
+  migrate_move "$SCRIPT_DIR/linux" "$WORK_DATA_DIR/linux"
+  # Last, so an interrupted run still finds the old env on the next try.
+  migrate_move "$SCRIPT_DIR/.env" "$WORK_ENV"
+  [ -f "$WORK_ENV" ] && chmod 600 "$WORK_ENV"
+
+  echo ""
+  success "Migrated."
+  echo ""
+  cmd_paths
+  echo ""
+  info "Next: ./work.sh up, then ./work.sh connect"
 }
 
 # --- Setup / preflight ---
@@ -721,7 +1275,7 @@ check() {
   return 1
 }
 
-# Single-quote a value for safe inclusion in .env, which load_env later sources.
+# Single-quote a value for safe inclusion in the env file, which load_env sources.
 # Without this a value with a space, $, #, quote or backslash breaks sourcing:
 # each embedded ' becomes '\'' and the whole is wrapped in single quotes.
 env_quote() {
@@ -742,12 +1296,14 @@ cmd_doctor() {
   echo ""
   check opt "FreeRDP"            'command -v xfreerdp3 || command -v xfreerdp'  "Only for ./work.sh windows rdp (package: freerdp). ./work.sh windows web works without it." || true
   check opt "jq"                 'command -v jq'                       "Only for Hyprland RDP scale detection." || true
+  check opt "OpenSSH client"     'command -v ssh && command -v ssh-keygen'  "Only for ./work.sh windows sync (package: openssh)." || true
 
   echo ""
   # Repo integrity. The Linux image build copies this snapshot, so a clone
   # missing it fails the build. Catch it here, not halfway through a build.
   check req "Linux image rootfs" "[ -d '$SCRIPT_DIR/linux-image/rootfs' ]" "linux-image/rootfs/ is missing. It must be committed to the repo; ask whoever shared it." || fails=$((fails + 1))
-  check opt ".env"               "[ -f '$SCRIPT_DIR/.env' ]"           "Not configured yet. Run ./work.sh setup." || true
+  check opt "env file"           "[ -f '$WORK_ENV' ]"                  "Not configured yet. Run ./work.sh setup, or ./work.sh migrate if .env is still in the repo." || true
+  check opt "folder layout"      "! [ -e '$SCRIPT_DIR/.env' -o -e '$SCRIPT_DIR/windows' -o -e '$SCRIPT_DIR/linux' -o -e '$SCRIPT_DIR/shared' -o -e '$SCRIPT_DIR/certificates' ]" "Old in-repo layout. Run ./work.sh migrate." || true
 
   echo ""
   if [ "$fails" -gt 0 ]; then
@@ -758,10 +1314,11 @@ cmd_doctor() {
 }
 
 cmd_setup() {
-  local env_file="$SCRIPT_DIR/.env"
+  local env_file="$WORK_ENV"
   local example="$SCRIPT_DIR/.env.example"
 
   [ -f "$example" ] || die ".env.example not found. Run this from the repo root."
+  legacy_items >/dev/null && die "Found the old in-repo layout. Run ./work.sh migrate instead."
 
   echo -e "${BOLD}Work environment setup${NC}"
   echo ""
@@ -770,18 +1327,18 @@ cmd_setup() {
   echo ""
 
   if [ -f "$env_file" ]; then
-    warn ".env already exists."
-    read -p "Overwrite it (a backup goes to .env.bak)? [y/N] " ans
+    warn "$(tilde "$env_file") already exists."
+    read -p "Overwrite it (a backup goes to env.bak)? [y/N] " ans
     case "$ans" in
       y | Y) cp "$env_file" "$env_file.bak" ;;
       *)
-        info "Keeping existing .env. Nothing changed."
+        info "Keeping the existing env file. Nothing changed."
         return 0
         ;;
     esac
   fi
 
-  local username vm_password vpn_server vpn_password corporate_dns extra_routes test_host
+  local username vm_password vpn_server vpn_password corporate_dns extra_routes test_host ad_domain sso_sites
 
   read -p "Local guest username (USERNAME) [your.username]: " username
   username="${username:-your.username}"
@@ -790,22 +1347,28 @@ cmd_setup() {
   echo ""
   if [ -z "$vm_password" ]; then
     vm_password=$(gen_password)
-    info "Generated a random VM_PASSWORD. It is stored in .env; read it there if you log in to Windows directly."
+    info "Generated a random VM_PASSWORD. It is stored in $(tilde "$env_file"); read it there if you log in to Windows directly."
   fi
 
   read -p "VPN gateway IP (VPN_SERVER) [IT]: " vpn_server
   read -rsp "VPN password (VPN_PASSWORD), rotates ~45d, Enter to fill later: " vpn_password
   echo ""
   read -p "Corporate DNS (CORPORATE_DNS) [IT]: " corporate_dns
-  read -p "Extra ranges through the tunnel (VPN_EXTRA_ROUTES), comma-separated [GitHub ranges]: " extra_routes
-  extra_routes="${extra_routes:-$GITHUB_ROUTES}"
+  read -p "Extra ranges through the tunnel (VPN_EXTRA_ROUTES), comma-separated, 'github' = GitHub's live ranges [github]: " extra_routes
+  extra_routes="${extra_routes:-github}"
   read -p "Internal host for ./work.sh test (VPN_TEST_HOST) [optional]: " test_host
+  read -p "AD domain for Windows silent login (AD_DOMAIN), e.g. corp.example.com [optional]: " ad_domain
+  if [ -n "$ad_domain" ]; then
+    read -p "Sites that get silent login (SSO_SITES), comma-separated [*.$ad_domain]: " sso_sites
+  fi
 
   # Single-quote every value so load_env can source the file even when a
   # password holds a space, $, #, quote or backslash. chmod is explicit
   # because umask only applies to a newly created file; overwriting an
-  # existing .env in place would otherwise keep its old, looser mode.
+  # existing file in place would otherwise keep its old, looser mode.
   umask 077
+  mkdir -p "$WORK_CONFIG_DIR" "$CERT_DIR" "$GUEST_SSH_DIR"
+  chmod 700 "$WORK_CONFIG_DIR"
   cat >"$env_file" <<EOF
 # Generated by ./work.sh setup. Edit freely; re-run setup to regenerate.
 
@@ -828,10 +1391,19 @@ VPN_EXTRA_ROUTES=$(env_quote "$extra_routes")
 
 # Internal-only hostname for ./work.sh test.
 VPN_TEST_HOST=$(env_quote "$test_host")
+
+# --- Windows silent login (pushed by ./work.sh windows sync) ---
+# The AD account is AD_USER (default USERNAME@AD_DOMAIN) with AD_PASSWORD
+# (default VPN_PASSWORD). SSO_SITES defaults to *.AD_DOMAIN.
+AD_DOMAIN=$(env_quote "$ad_domain")
+SSO_SITES=$(env_quote "$sso_sites")
+#AD_USER=
+#AD_PASSWORD=
 EOF
   chmod 600 "$env_file"
 
-  success ".env written."
+  success "$(tilde "$env_file") written."
+  info "Drop internal CA files into $(tilde "$CERT_DIR") and guest SSH keys into $(tilde "$GUEST_SSH_DIR")."
   echo ""
   info "Next:"
   info "  ./work.sh doctor    check prerequisites"
@@ -846,6 +1418,9 @@ case "${1:-help}" in
   disconnect) cmd_disconnect ;;
   reconnect)  shift; cmd_reconnect "$@" ;;
   setup)      cmd_setup ;;
+  migrate)    cmd_migrate ;;
+  paths)      cmd_paths ;;
+  open)       shift; cmd_open "$@" ;;
   doctor)     cmd_doctor ;;
   status)     cmd_status ;;
   test)       shift; cmd_test "$@" ;;
