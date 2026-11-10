@@ -1,10 +1,12 @@
 .env
 .env.*
 !.env.example
+# Old in-repo layout (./work.sh migrate moves these out); kept so an
+# unmigrated checkout never commits them.
 windows/
 macos/
 linux/
 certificates/
-shared/*
-!shared/.gitkeep
+shared/
 .claude/settings.local.json
+.work/

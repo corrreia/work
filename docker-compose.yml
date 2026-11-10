@@ -19,6 +19,7 @@ services:
       - 127.0.0.1:8007:8006       # windows web viewer (8007 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/tcp   # RDP (3390 to avoid omarchy conflict)
       - 127.0.0.1:3390:3389/udp
+      - 127.0.0.1:2222:22/tcp     # Windows sshd, used by ./work.sh windows sync
     restart: no
 
   windows:
@@ -43,9 +44,10 @@ services:
       - /dev/net/tun
     cap_add:
       - NET_ADMIN
+    # Paths come from work.sh (./work.sh paths); run compose through it.
     volumes:
-      - ./windows:/storage
-      - ./shared:/shared
+      - ${WORK_DATA_DIR:?run through ./work.sh}/windows:/storage
+      - ${WORK_SHARED_DIR:?run through ./work.sh}:/shared
     restart: no
     stop_grace_period: 2m
 
@@ -62,7 +64,7 @@ services:
       USERNAME: "${USERNAME}"
       PASSWORD: "${VM_PASSWORD}"
     volumes:
-      - ./linux:/home/${USERNAME}
-      - ./shared:/shared
-      - ./certificates:/usr/local/share/ca-certificates/internal:ro
+      - ${WORK_DATA_DIR:?run through ./work.sh}/linux:/home/${USERNAME}
+      - ${WORK_SHARED_DIR:?run through ./work.sh}:/shared
+      - ${WORK_CONFIG_DIR:?run through ./work.sh}/certificates:/usr/local/share/ca-certificates/internal:ro
     restart: no
