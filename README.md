@@ -172,8 +172,34 @@ The Linux image mirrors the Omarchy terminal: the same bash rc chain (aliases, `
 - Docker and Docker Compose
 - KVM (`/dev/kvm`)
 - `xfreerdp3` (package: `freerdp`) for RDP
-- `jq` for Hyprland scale detection
+- `jq` (GitHub ranges at connect, Windows sync input, Hyprland scale detection)
 - `ssh` and `ssh-keygen` (package: `openssh`) for Windows sync
+
+## Repository layout
+
+```
+work.sh                  entry point; dispatches to lib/
+lib/common.sh            paths, env file, output helpers, docker compose
+lib/vpn.sh               connect, disconnect, split routing, ./work.sh test
+lib/guests.sh            up, down, status, logs, the Linux container
+lib/windows.sh           Windows sync, bootstrap, RDP
+lib/setup.sh             help, paths, migrate, doctor, setup
+scripts/vpn/work-net.sh  runs inside work-vpn: NAT, routes, DNS redirect, probe
+scripts/windows/*.ps1    runs inside Windows: machine, user and credential sync, bootstrap
+tests/                   bats tests; tests/run.sh lints and tests everything
+```
+
+Code that runs inside a container or Windows lives in its own file under `scripts/`, never as a heredoc in bash. Bash only passes data: arguments to `work-net`, one base64-encoded JSON object to each PowerShell script.
+
+## Development
+
+```bash
+tests/run.sh         # shellcheck, PowerShell parse + PSScriptAnalyzer, bats
+tests/run.sh lint    # only the linters
+tests/run.sh test    # only the bats tests
+```
+
+It uses `shellcheck` and `bats` from `PATH` (packages `shellcheck`, `bash-bats`), or fetches them with `uvx`/`npx`. The PowerShell checks need `pwsh` and are skipped without it. The tests run in a temporary home and never touch `~/.config/work` or Docker.
 
 ## Notes
 

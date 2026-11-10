@@ -52,14 +52,22 @@ fails, fix the cause `doctor` names rather than working around it.
 
 ## Where things live
 
-- `work.sh` is the single entry point (setup, doctor, VPN, both guests). Its helpers are
-  `die/info/success/warn` and the color vars; match them.
+- `work.sh` is the single entry point (setup, doctor, VPN, both guests). It only sources
+  `lib/*.sh` and dispatches; it runs with `set -euo pipefail`, so default every optional
+  env var (`${VAR:-}`) and guard expected failures. Helpers are `die/info/success/warn` and
+  the color vars in `lib/common.sh`; match them.
+- **No code in heredocs.** Anything that runs inside `work-vpn` goes in
+  `scripts/vpn/work-net.sh` (installed into the container by rename on every use, so the
+  running snx-rs supervisor is never rewritten under itself). Anything that runs in Windows
+  goes in `scripts/windows/*.ps1`, which take one `$Work` object; bash builds it as JSON with
+  `jq` and `ps_invocation` sends it base64-encoded. Secrets reach `jq` through its
+  environment or stdin, never argv.
 - `snx-rs.conf` is the VPN tunnel config, read at `connect` time.
 - `docker-compose.yml` defines the three services; the guests use `network_mode: service:vpn`.
 - `linux-image/` builds the Arch container. `rootfs/` is a snapshot of the host's Omarchy
   terminal config, taken by `sync-host-config.sh`. These defaults are personal; a colleague
   can keep them or delete items in their home to get fresh copies.
-- Paths are set once at the top of `work.sh` (`set_paths`); use those variables
+- Paths are set once in `lib/common.sh` (`set_paths`); use those variables
   (`CERT_DIR`, `GUEST_SSH_DIR`, `WORK_DATA_DIR`, ...) rather than literal paths.
 
 ## Verifying a change
@@ -67,6 +75,9 @@ fails, fix the cause `doctor` names rather than working around it.
 - `./work.sh doctor` after any change to prerequisites or the build.
 - `./work.sh connect` then `./work.sh test <internal-host>` after any routing, DNS, or
   `snx-rs.conf` change. "Inconclusive" is not a pass; confirm both guests reach the host.
-- `bash -n work.sh` (and `shellcheck work.sh` if available) after editing the script.
+- `tests/run.sh` after editing any script: shellcheck, PowerShell parse + PSScriptAnalyzer
+  (when `pwsh` is installed) and the bats tests. Add a test for new pure logic. Tests must
+  pin every path to their temp home, as `tests/helpers.bash` does: overriding only `HOME`
+  is not enough when `XDG_CONFIG_HOME` is set, and writes would land in the real config.
 - `./work.sh windows sync` after any change to the sync, then confirm in Windows: the CAs
   in `certlm.msc`, the entries in Credential Manager, and a silent login to an SSO site.

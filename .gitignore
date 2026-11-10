@@ -2,11 +2,12 @@
 .env.*
 !.env.example
 # Old in-repo layout (./work.sh migrate moves these out); kept so an
-# unmigrated checkout never commits them.
-windows/
-macos/
-linux/
-certificates/
-shared/
+# unmigrated checkout never commits them. Anchored to the repo root, so
+# scripts/windows/ is still tracked.
+/windows/
+/macos/
+/linux/
+/certificates/
+/shared/
 .claude/settings.local.json
-.work/
+/.work/
