@@ -7,15 +7,24 @@ VPN_HELPER="/usr/local/sbin/work-net"
 
 # Corporate GitHub is IP-allowlisted to company egress, so GitHub routes through
 # the tunnel by default: "github" in VPN_EXTRA_ROUTES expands at connect time to
-# the live ranges from api.github.com/meta. This fixed list is only the fallback
-# when that fetch fails; it misses GitHub's regional Azure addresses.
+# the live ranges from api.github.com/meta plus the current addresses of
+# GITHUB_HOSTS. This fixed list is only the fallback when the meta fetch fails;
+# it misses GitHub's regional Azure addresses.
 GITHUB_ROUTES="192.30.252.0/22,185.199.108.0/22,140.82.112.0/20,143.55.64.0/20"
 GITHUB_META="https://api.github.com/meta"
 
-# GitHub's current IPv4 ranges for web, api and git, comma-separated, from the
-# meta JSON on stdin. Empty when the input is not the meta document.
+# Hosts resolved at connect, as the guests resolve them, and routed as /32s.
+# The meta document does not list every address these answer on (from Europe
+# codeload.github.com resolves to an Azure address that no meta key contains).
+GITHUB_HOSTS="github.com api.github.com codeload.github.com uploads.github.com
+gist.github.com ghcr.io raw.githubusercontent.com objects.githubusercontent.com
+github-releases.githubusercontent.com pkg-containers.githubusercontent.com"
+
+# GitHub's current IPv4 ranges for web, api, git and packages (ghcr.io),
+# comma-separated, from the meta JSON on stdin. Empty when the input is not the
+# meta document.
 github_ranges_from_meta() {
-  jq -r '[.web[]?, .api[]?, .git[]?]
+  jq -r '[.web[]?, .api[]?, .git[]?, .packages[]?]
     | map(select(test("^[0-9]+(\\.[0-9]+){3}/[0-9]+$")))
     | unique | join(",")' 2>/dev/null || true
 }
@@ -25,13 +34,36 @@ github_ranges_from_meta() {
 # from Europe), and any it misses leaves through the home address and hits the
 # IP allow list.
 github_routes() {
-  local routes
+  local routes hosts
   routes=$(curl -fsS --max-time 10 "$GITHUB_META" 2>/dev/null | github_ranges_from_meta) || routes=""
   if [ -z "$routes" ]; then
     warn "Could not fetch GitHub's ranges from $GITHUB_META; using the built-in list, which misses its regional addresses." >&2
     routes="$GITHUB_ROUTES"
   fi
-  printf '%s' "$routes"
+  hosts=$(github_host_routes)
+  printf '%s' "$routes${hosts:+,$hosts}"
+}
+
+# IPv4 addresses of one host as /32s, one per line, resolved inside work-vpn so
+# the answer comes from the same DNS the guests use.
+resolve_in_vpn() {
+  docker exec work-vpn getent ahostsv4 "$1" 2>/dev/null |
+    awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ { print $1 "/32" }' | sort -u || true
+}
+
+# Current addresses of GITHUB_HOSTS, comma-separated. A host that does not
+# resolve is skipped with a warning rather than failing the connect.
+github_host_routes() {
+  local host addrs out=""
+  for host in $GITHUB_HOSTS; do
+    addrs=$(resolve_in_vpn "$host")
+    if [ -z "$addrs" ]; then
+      warn "Could not resolve $host inside work-vpn; it is not routed by address." >&2
+      continue
+    fi
+    out="${out:+$out,}$(printf '%s' "$addrs" | paste -sd,)"
+  done
+  printf '%s' "$out"
 }
 
 # VPN_EXTRA_ROUTES with "github" expanded. Entries are validated because they

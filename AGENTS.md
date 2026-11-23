@@ -30,7 +30,8 @@ fails, fix the cause `doctor` names rather than working around it.
 - **Split tunnel by route.** Only RFC 1918 ranges plus `VPN_EXTRA_ROUTES` go through the
   tunnel; everything else goes direct over the home connection. Corporate GitHub is
   IP-allowlisted to company egress addresses, so `VPN_EXTRA_ROUTES` must keep `github`
-  (expanded at connect to the live ranges from api.github.com/meta) or git is blocked from
+  (expanded at connect to the live ranges from api.github.com/meta plus the resolved
+  addresses of `GITHUB_HOSTS` in `lib/vpn.sh`) or git is blocked from
   both guests. Never replace it with a fixed list: GitHub adds regional addresses (from
   Europe github.com resolves into Azure) and anything missed leaves by the home IP.
 - **`linux-image/rootfs/` must be committed.** The Dockerfile does `COPY linux-image/rootfs/ /`,
