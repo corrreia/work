@@ -160,7 +160,7 @@ The `Shared` desktop shortcut then works. You can also map it as a drive with `n
 
 ## Linux terminal environment
 
-The Linux image mirrors the Omarchy terminal: the same bash rc chain (aliases, `cd`→zoxide, fzf, inputrc), starship prompt, LazyVim, lazygit, btop, eza, bat, ripgrep, fd, mise, gh, and tmux. Ghostty and Kitty terminfo are installed and `TERM` is passed through, so colours and keys behave as on the host.
+The Linux image mirrors the Omarchy terminal: the same bash rc chain (aliases, `cd`→zoxide, fzf, inputrc), starship prompt, LazyVim, lazygit, btop, eza, bat, ripgrep, fd, mise, gh, tmux, and the herdr and pi (pi.dev) agent tools. Ghostty and Kitty terminfo are installed and `TERM` is passed through, so colours and keys behave as on the host.
 
 - `linux-image/rootfs/` is a snapshot of the host's `/usr/share/omarchy/default/bash` and `~/.config/{starship.toml,nvim,lazygit,btop}`, taken by `linux-image/sync-host-config.sh`. `./work.sh linux rebuild` re-takes it and rebuilds.
 - On startup the configs are seeded into the home directory, but only the items that are missing. Anything you edit or delete stays that way. Delete an item to get the fresh copy.

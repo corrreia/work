@@ -12,6 +12,22 @@ RUN pacman -Syu --noconfirm --needed \
       ghostty-terminfo kitty-terminfo \
     && pacman -Scc --noconfirm
 
+# Agent tooling: herdr (workspace manager) and pi (pi.dev coding agent), from
+# the same aqua sources Omarchy's mise config uses on the host, checksum-checked.
+# Installed system-wide, not in the home, which is a bind mount that hides
+# anything the image puts there. Latest at build time; rebuild to update.
+ENV WORK_TOOLS_DIR=/opt/work-tools
+RUN MISE_DATA_DIR="$WORK_TOOLS_DIR" MISE_CACHE_DIR=/tmp/mise-cache \
+      mise install aqua:herdrdev/herdr@latest aqua:earendil-works/pi@latest \
+    && for bin in herdr pi; do \
+         path="$(find "$WORK_TOOLS_DIR/installs" -type f -name "$bin" -perm -u+x | head -n1)"; \
+         [ -n "$path" ] || { echo "mise installed no $bin binary" >&2; exit 1; }; \
+         ln -sf "$path" "/usr/local/bin/$bin"; \
+       done \
+    && chmod -R a+rX "$WORK_TOOLS_DIR" \
+    && rm -rf /tmp/mise-cache \
+    && herdr --version && pi --version
+
 # Snapshot of the host's Omarchy shell defaults and terminal configs
 # (refresh with linux-image/sync-host-config.sh), plus container shims.
 COPY linux-image/rootfs/ /
