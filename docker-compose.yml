@@ -66,5 +66,5 @@ services:
     volumes:
       - ${WORK_DATA_DIR:?run through ./work.sh}/linux:/home/${USERNAME}
       - ${WORK_SHARED_DIR:?run through ./work.sh}:/shared
-      - ${WORK_CONFIG_DIR:?run through ./work.sh}/certificates:/usr/local/share/ca-certificates/internal:ro
+      - ${WORK_CONFIG_DIR:?run through ./work.sh}/certificates:/etc/ca-certificates/trust-source/anchors:ro
     restart: no

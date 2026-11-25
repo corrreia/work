@@ -31,11 +31,11 @@ chmod 0440 "/etc/sudoers.d/${username}"
 
 mkdir -p /run/sshd
 
-if [ -d /usr/local/share/ca-certificates/internal ]; then
-  find /usr/local/share/ca-certificates/internal -type f \( -name '*.crt' -o -name '*.cer' -o -name '*.pem' \) | grep -q . && update_certs=1 || update_certs=0
-  if [ "$update_certs" = "1" ]; then
-    trust extract-compat
-  fi
+# The host's CA files are mounted into p11-kit's anchors directory, the only
+# place Arch reads trust anchors from (DER or PEM). Regenerate the bundles in
+# /etc/ssl/certs so OpenSSL, curl and git see them too.
+if find /etc/ca-certificates/trust-source/anchors -type f | grep -q .; then
+  trust extract-compat
 fi
 
 cat > /etc/ssh/sshd_config.d/work.conf <<EOF
